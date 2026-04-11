@@ -113,6 +113,11 @@ class FramePusher:
             )
         except subprocess.TimeoutExpired:
             raise AdbError(f"ADB command timed out ({timeout}s): {' '.join(cmd)}")
+        except FileNotFoundError:
+            # adb disappeared from PATH (uninstalled) after startup — the
+            # health check at startup may have passed, so we still need to
+            # handle this at every push.
+            raise AdbError("adb is not installed or not on PATH")
 
         if result.returncode != 0:
             raise AdbError(

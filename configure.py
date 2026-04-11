@@ -104,12 +104,20 @@ def main() -> None:
     config["frame"]["adb_ip"] = frame_info["ip"]
     config["frame"]["adb_port"] = 5555
     config["frame"]["photo_path"] = frame_info.get("photo_path") or "/sdcard/DCIM/"
-    w, h = frame_info.get("resolution") or (1280, 800)
-    if w and h:
-        config["frame"]["resolution_width"] = w
-        config["frame"]["resolution_height"] = h
+    # Note: (0, 0) is a truthy tuple in Python, so we can't rely on `or`
+    # to fall back. Check each dimension explicitly.
+    resolution = frame_info.get("resolution") or (0, 0)
+    w, h = resolution if len(resolution) == 2 else (0, 0)
+    if not w or not h:
+        # discover_frame or adb_setup couldn't parse `wm size` — use the
+        # existing config values if any, otherwise a sane default.
+        w = config["frame"].get("resolution_width") or 1280
+        h = config["frame"].get("resolution_height") or 800
+        print(f"  Could not auto-detect resolution, using {w}x{h}")
+    config["frame"]["resolution_width"] = w
+    config["frame"]["resolution_height"] = h
     print(f"  Frame IP:        {frame_info['ip']}")
-    print(f"  Resolution:      {config['frame']['resolution_width']}x{config['frame']['resolution_height']}")
+    print(f"  Resolution:      {w}x{h}")
     print(f"  Photo path:      {config['frame']['photo_path']}")
     print()
 
