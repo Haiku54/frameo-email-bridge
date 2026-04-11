@@ -191,6 +191,14 @@ def _prompt_yesno(label: str, default: bool = True) -> bool:
 
 def _discover_frame() -> dict | None:
     """Try USB first, then network scan. Returns frame info dict or None."""
+    if not shutil.which("adb"):
+        print("  ERROR: adb is not installed on this system.")
+        print("  Install it first:")
+        print("    Linux:   sudo apt install adb")
+        print("    macOS:   brew install android-platform-tools")
+        print("    Windows: https://developer.android.com/tools/releases/platform-tools")
+        sys.exit(1)
+
     # Check for USB device
     try:
         result = subprocess.run(
@@ -206,12 +214,17 @@ def _discover_frame() -> dict | None:
         if usb_serial:
             print(f"  Found USB-connected device: {usb_serial}")
             return _setup_via_usb(usb_serial)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    except subprocess.TimeoutExpired:
+        print("  WARNING: `adb devices` timed out")
 
     # No USB device - try network scan
     print("  No USB device found. Scanning local network...")
-    frames = discover_frame.find_frames()
+    try:
+        frames = discover_frame.find_frames()
+    except discover_frame.AdbNotInstalledError as e:
+        print(f"  ERROR: {e}")
+        sys.exit(1)
+
     if len(frames) == 1:
         return frames[0]
     if len(frames) > 1:

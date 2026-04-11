@@ -9,6 +9,7 @@ import logging
 import platform
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,10 @@ def process_video(input_path: Path, output_path: Path, config: dict) -> Path:
     """Process a single video: trim to max duration, scale, re-encode as H.264/AAC.
 
     Returns the output path on success. Raises VideoProcessingError on failure.
+
+    Each encode attempt writes to a temp file and is only promoted to
+    ``output_path`` on success. A failed encode never leaves a corrupt file
+    in ``output_path``.
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -49,6 +54,25 @@ def process_video(input_path: Path, output_path: Path, config: dict) -> Path:
     max_h = int(config.get("resolution_height", 800))
     max_bytes = int(config.get("video_max_file_size_mb", 20) * 1024 * 1024)
 
+    # Fast path: if the file is already an .mp4, already short enough,
+    # already within the size budget, and already within the target
+    # resolution, just copy it rather than re-encoding.
+    if (
+        input_path.suffix.lower() == ".mp4"
+        and duration <= max_duration
+        and input_path.stat().st_size <= max_bytes
+    ):
+        dims = _get_video_dimensions(input_path)
+        if dims and dims[0] <= max_w and dims[1] <= max_h:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(input_path), str(output_path))
+            logger.info(
+                "Passed through video: %s (%d KB, %dx%d, %.1fs) — no re-encode needed",
+                input_path.name, output_path.stat().st_size // 1024,
+                dims[0], dims[1], duration,
+            )
+            return output_path
+
     trim_seconds = min(duration, max_duration)
     if duration > max_duration:
         logger.info(
@@ -56,31 +80,79 @@ def process_video(input_path: Path, output_path: Path, config: dict) -> Path:
             duration, max_duration,
         )
 
-    # Try encoding with CRF 23 first; if too large, retry with higher CRF (lower quality)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Try encoding with CRF 23 first; if too large, retry with higher CRF
+    # (lower quality). Write each attempt to a temp file so a failed ffmpeg
+    # run never leaves a corrupt partial file at output_path.
+    last_tmp: Path | None = None
     for crf in (23, 26, 29, 32):
-        _encode_video(
-            input_path=input_path,
-            output_path=output_path,
-            trim_seconds=trim_seconds,
-            max_w=max_w,
-            max_h=max_h,
-            crf=crf,
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            suffix=".mp4", dir=str(output_path.parent)
         )
-        size = output_path.stat().st_size
+        import os as _os
+        _os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+
+        try:
+            _encode_video(
+                input_path=input_path,
+                output_path=tmp_path,
+                trim_seconds=trim_seconds,
+                max_w=max_w,
+                max_h=max_h,
+                crf=crf,
+            )
+        except VideoProcessingError:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        size = tmp_path.stat().st_size
         if size <= max_bytes:
+            tmp_path.replace(output_path)
             logger.info(
                 "Processed video: %s -> %s (%d KB, crf=%d)",
                 input_path.name, output_path.name, size // 1024, crf,
             )
             return output_path
-        logger.debug("Size %d KB at crf %d, re-encoding...", size // 1024, crf)
 
+        logger.debug("Size %d KB at crf %d, re-encoding...", size // 1024, crf)
+        # Keep the last attempt around so we have something if all loops exceed the limit
+        if last_tmp is not None:
+            last_tmp.unlink(missing_ok=True)
+        last_tmp = tmp_path
+
+    # All CRF values overshot the budget. Use the largest-CRF (smallest) attempt.
+    assert last_tmp is not None
+    last_tmp.replace(output_path)
     logger.warning(
         "Video %s still %d KB at crf 32, keeping anyway",
         output_path.name, output_path.stat().st_size // 1024,
     )
     return output_path
+
+
+def _get_video_dimensions(path: Path) -> tuple[int, int] | None:
+    """Return (width, height) from ffprobe, or None on failure."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+        return int(stream["width"]), int(stream["height"])
+    except (KeyError, IndexError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def get_video_duration(path: Path) -> float:

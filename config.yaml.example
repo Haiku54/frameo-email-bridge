@@ -13,6 +13,8 @@ frame:
   photo_path: "/sdcard/DCIM/"     # Frameo reads photos/videos from here
   resolution_width: 1280          # Auto-detected by configure.py via `adb shell wm size`
   resolution_height: 800
+  push_timeout: 60                # Seconds to wait for `adb push` before giving up.
+                                  # Increase for very large videos or slow WiFi (e.g. 120).
 
 processing:
   # Image settings

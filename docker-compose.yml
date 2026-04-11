@@ -3,9 +3,20 @@ services:
     build: .
     container_name: frameo-bridge
     restart: unless-stopped
-    network_mode: host        # Required for ADB to reach the frame on local network
+    # network_mode: host is required so the container can reach the Frameo
+    # frame on your LAN via ADB (the frame listens on 5555/tcp).
+    network_mode: host
     volumes:
+      # IMPORTANT: config.yaml must exist on the host BEFORE running
+      # `docker compose up`. Generate it by running `bash setup.sh` once
+      # (or copy config.yaml.example -> config.yaml and edit it manually).
+      # If the file does not exist, Docker will create an empty directory
+      # at this path and the container will fail to start.
       - ./config.yaml:/app/config.yaml:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
+      # Runtime directories — all persisted to the host so nothing is lost
+      # on container restart.
+      - ./inbox:/app/inbox
+      - ./processed:/app/processed
       - ./archive:/app/archive
+      - ./logs:/app/logs
+      - ./data:/app/data

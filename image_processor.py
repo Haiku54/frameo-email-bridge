@@ -85,14 +85,16 @@ def process_image(input_path: Path, output_path: Path, config: dict) -> Path:
     elif img.mode != "RGB":
         img = img.convert("RGB")
 
-    # Strip metadata by copying pixel data to a clean image
-    clean = Image.new("RGB", img.size)
-    clean.putdata(list(img.getdata()))
+    # Note: metadata (EXIF/IPTC/XMP) stripping happens implicitly during
+    # JPEG save — Pillow does not propagate EXIF unless you explicitly pass
+    # `exif=` to save(). We previously copied pixels into a fresh image to
+    # strip metadata, but that allocates ~120 MB of Python objects per image
+    # on a 1280x800 source, causing OOM on Raspberry Pi.
 
     # Save with size optimization
     max_bytes = int(config.get("max_file_size_mb", 2) * 1024 * 1024)
     initial_quality = config.get("jpeg_quality", 85)
-    _save_within_size_limit(clean, output_path, initial_quality, max_bytes)
+    _save_within_size_limit(img, output_path, initial_quality, max_bytes)
 
     logger.info(
         "Processed: %s -> %s (%d KB)",

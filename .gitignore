@@ -12,12 +12,14 @@ ENV/
 # Config with credentials
 config.yaml
 
-# Runtime directories (contain user photos, videos, logs)
+# Runtime directories (contain user photos, videos, logs — may be sensitive)
 inbox/
 processed/
 archive/
 logs/
 data/
+# Docker empty-directory artifact (created by Docker when config.yaml is missing on first run)
+/config.yaml/
 
 # Log files
 *.log

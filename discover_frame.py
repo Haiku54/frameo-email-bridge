@@ -20,11 +20,25 @@ ADB_CONNECT_TIMEOUT = 8
 MAX_WORKERS = 64
 
 
+class AdbNotInstalledError(RuntimeError):
+    """Raised when the adb binary is not available on PATH."""
+
+
 def find_frames() -> list[dict]:
     """Full discovery: scan subnet, connect via ADB, identify Frameo frames.
 
     Returns a list of dicts: {ip, model, resolution, photo_path}.
+    Raises AdbNotInstalledError if adb is not found on PATH.
     """
+    import shutil as _shutil
+    if not _shutil.which("adb"):
+        raise AdbNotInstalledError(
+            "adb is not installed. Install with:\n"
+            "  Linux:   sudo apt install adb\n"
+            "  macOS:   brew install android-platform-tools\n"
+            "  Windows: https://developer.android.com/tools/releases/platform-tools"
+        )
+
     subnet = get_local_subnet()
     if not subnet:
         logger.warning("Could not detect local subnet")
@@ -179,10 +193,19 @@ def _adb_connect(device: str) -> bool:
 
 
 def _adb_shell(device: str, *args: str) -> str:
+    """Run `adb -s device shell ...` and return stdout.
+
+    Raises subprocess.TimeoutExpired or RuntimeError on failure. Callers
+    should catch these explicitly.
+    """
     result = subprocess.run(
         ["adb", "-s", device, "shell"] + list(args),
         capture_output=True, text=True, timeout=10,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"adb -s {device} shell {' '.join(args)} failed: {result.stderr.strip()}"
+        )
     return result.stdout
 
 

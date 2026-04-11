@@ -89,9 +89,16 @@ class EmailMonitor:
                 try:
                     msg_attachments = self._process_email(conn, uid)
                     attachments.extend(msg_attachments)
+                except (ConnectionResetError, TimeoutError, OSError, imaplib.IMAP4.error) as e:
+                    # Transient network/protocol errors: leave UID unmarked so
+                    # the next polling cycle will retry (email is still UNSEEN).
+                    logger.warning("Transient error on UID %s, will retry next cycle: %s", uid, e)
+                    # Bail out of the loop — the connection is likely broken anyway
+                    raise
                 except Exception as e:
-                    logger.error("Error processing UID %s: %s", uid, e)
-                    # Mark as processed to avoid infinite retry on broken emails
+                    # Structural/parse errors (malformed email etc.) — mark as
+                    # processed so we don't infinite-loop on a broken email.
+                    logger.error("Permanent error on UID %s, skipping: %s", uid, e)
                     self._mark_uid_processed(uid, "", "", 0)
 
         except imaplib.IMAP4.error as e:

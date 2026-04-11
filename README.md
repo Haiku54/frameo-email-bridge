@@ -33,20 +33,42 @@ cd frameo-email-bridge
 bash setup.sh      # interactive — asks for everything
 ```
 
-The setup script will:
-1. Create a Python virtual environment
-2. Install dependencies
-3. Ask for your Gmail credentials, subject filter, video settings
-4. Auto-discover your Frameo frame (USB or network scan)
-5. Save everything to `config.yaml`
-6. Optionally send a test image
+### What `bash setup.sh` does
 
-Then to run the service:
+1. Verifies Python 3.10+, `adb`, and `ffmpeg` are installed
+2. Creates a Python virtual environment at `.venv/`
+3. Installs the Python dependencies from `requirements.txt`
+4. Creates runtime directories (`inbox/`, `processed/`, `archive/`, `logs/`, `data/`)
+5. Copies `config.yaml.example` → `config.yaml` if missing
+6. **Automatically launches `configure.py`** — the interactive wizard
+
+### What `configure.py` will ask you
+
+- Your Gmail address and App Password (input hidden)
+- A subject filter keyword (e.g. `Frameo`) — leave blank to accept all
+- An allowed-senders whitelist — blank to accept all
+- Whether to accept video attachments + maximum video duration
+- Confirmation to auto-discover your Frameo frame
+- Confirmation to push a test image
+
+It then detects the frame (USB first, network scan second) and saves everything to `config.yaml`.
+
+### Running the service after setup
 
 ```bash
 source .venv/bin/activate
 python main.py
 ```
+
+### Re-running configuration later
+
+To change your Gmail password, subject filter, frame IP, or any other setting, run the configuration wizard again:
+
+```bash
+.venv/bin/python configure.py
+```
+
+It will read your existing `config.yaml` and let you accept each current value by pressing Enter, or type a new one.
 
 ---
 
@@ -239,24 +261,50 @@ sudo systemctl start frameo-bridge    # start now
 
 ### Option C: Docker
 
-No Python or dependencies needed on the host (other than Docker + ADB for the first setup).
+Runs the service in a container. No Python dependencies on the host — but you still need `adb` and the interactive setup script to generate `config.yaml` before first launch.
+
+**Requirements on the host:**
+- Docker + Docker Compose
+- `adb` (needed once, for initial frame setup by `configure.py`)
+- `python3` + `python3-venv` (needed once, to run `configure.py`)
+
+**Step 1 — Generate `config.yaml` on the host:**
 
 ```bash
-# 1. Run configure.py once on the host to generate config.yaml
-# 2. Build and run:
+git clone https://github.com/Haiku54/frameo-email-bridge.git
+cd frameo-email-bridge
+bash setup.sh    # creates config.yaml via the interactive wizard
+```
+
+This creates all runtime directories and writes `config.yaml` with your Gmail credentials and the discovered frame IP.
+
+**Step 2 — Build and launch the container:**
+
+```bash
 docker compose up -d
 ```
+
+If you skip Step 1 and try to run `docker compose up` on a fresh clone, the container will fail fast with a clear error — Docker would otherwise create `./config.yaml` as an empty directory, which is not recoverable without manual cleanup.
 
 **Useful commands:**
 
 | Command | What it does |
 |---------|-------------|
-| `docker compose logs -f` | Watch logs |
-| `docker compose down` | Stop |
-| `docker compose up -d --build` | Rebuild and restart |
-| `docker compose restart` | Restart |
+| `docker compose logs -f` | Watch logs in real-time |
+| `docker compose down` | Stop and remove the container |
+| `docker compose up -d --build` | Rebuild image and restart |
+| `docker compose restart` | Restart the container |
 
-> `network_mode: host` in docker-compose.yml is required so the container can reach the frame's ADB port on your LAN.
+**How state is persisted:**
+
+The compose file bind-mounts every runtime directory to the host so nothing is lost on container restart:
+- `./config.yaml` (read-only)
+- `./inbox/`, `./processed/` — in-flight attachments (retry queue)
+- `./archive/` — successfully pushed files
+- `./logs/` — rotating log files
+- `./data/` — SQLite DB of processed email UIDs
+
+> `network_mode: host` is required in `docker-compose.yml` so the container can reach the Frameo frame's ADB port on your LAN.
 
 ---
 
@@ -267,13 +315,16 @@ All settings live in `config.yaml`. See `config.yaml.example` for the full templ
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `email.imap_server` | `imap.gmail.com` | IMAP server address |
+| `email.imap_port` | `993` | IMAP port (SSL) |
 | `email.poll_interval_seconds` | `120` | How often to check for new emails |
 | `email.subject_filter` | `""` | Only emails with this subject are processed (empty = all) |
 | `email.allowed_senders` | `[]` | Sender whitelist (empty = all) |
 | `frame.adb_ip` | set by configure.py | Frame's WiFi IP |
+| `frame.adb_port` | `5555` | ADB TCP port on the frame |
 | `frame.photo_path` | `/sdcard/DCIM/` | Where photos go on the frame |
 | `frame.resolution_width` | auto-detected | Horizontal resolution |
 | `frame.resolution_height` | auto-detected | Vertical resolution |
+| `frame.push_timeout` | `60` | Seconds to wait for `adb push` (increase for large videos) |
 | `processing.max_file_size_mb` | `2` | Max JPEG file size |
 | `processing.jpeg_quality` | `95` | JPEG quality (30-100) |
 | `processing.strip_exif` | `true` | Remove photo metadata |
@@ -320,6 +371,7 @@ frameo-email-bridge/
 ├── requirements.txt         # Python dependencies
 ├── Dockerfile               # Docker image definition
 ├── docker-compose.yml       # Docker Compose config
+├── docker-entrypoint.sh     # Validates config.yaml before starting the container
 ├── LICENSE                  # MIT
 ├── inbox/                   # Downloaded attachments (transient)
 ├── processed/               # Processed files awaiting push (transient)
