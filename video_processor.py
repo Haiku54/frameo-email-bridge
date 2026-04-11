@@ -6,6 +6,7 @@ for pushing to a Frameo digital frame. Uses ffmpeg via subprocess.
 
 import json
 import logging
+import os
 import platform
 import shutil
 import subprocess
@@ -86,50 +87,64 @@ def process_video(input_path: Path, output_path: Path, config: dict) -> Path:
     # (lower quality). Write each attempt to a temp file so a failed ffmpeg
     # run never leaves a corrupt partial file at output_path.
     last_tmp: Path | None = None
-    for crf in (23, 26, 29, 32):
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            suffix=".mp4", dir=str(output_path.parent)
+    try:
+        for crf in (23, 26, 29, 32):
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                suffix=".mp4", dir=str(output_path.parent)
+            )
+            os.close(tmp_fd)
+            tmp_path = Path(tmp_name)
+
+            try:
+                _encode_video(
+                    input_path=input_path,
+                    output_path=tmp_path,
+                    trim_seconds=trim_seconds,
+                    max_w=max_w,
+                    max_h=max_h,
+                    crf=crf,
+                )
+            except VideoProcessingError:
+                # Clean up the current attempt AND any previous oversized
+                # attempt we were holding onto as a fallback.
+                tmp_path.unlink(missing_ok=True)
+                raise
+
+            size = tmp_path.stat().st_size
+            if size <= max_bytes:
+                tmp_path.replace(output_path)
+                # Success: we owned last_tmp, it is no longer needed.
+                if last_tmp is not None:
+                    last_tmp.unlink(missing_ok=True)
+                    last_tmp = None
+                logger.info(
+                    "Processed video: %s -> %s (%d KB, crf=%d)",
+                    input_path.name, output_path.name, size // 1024, crf,
+                )
+                return output_path
+
+            logger.debug("Size %d KB at crf %d, re-encoding...", size // 1024, crf)
+            # Keep the smallest attempt around so we have something if all loops exceed the limit
+            if last_tmp is not None:
+                last_tmp.unlink(missing_ok=True)
+            last_tmp = tmp_path
+
+        # All CRF values overshot the budget. Use the smallest attempt.
+        assert last_tmp is not None
+        last_tmp.replace(output_path)
+        last_tmp = None  # promoted, no longer needs cleanup
+        logger.warning(
+            "Video %s still %d KB at crf 32, keeping anyway",
+            output_path.name, output_path.stat().st_size // 1024,
         )
-        import os as _os
-        _os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
-
-        try:
-            _encode_video(
-                input_path=input_path,
-                output_path=tmp_path,
-                trim_seconds=trim_seconds,
-                max_w=max_w,
-                max_h=max_h,
-                crf=crf,
-            )
-        except VideoProcessingError:
-            tmp_path.unlink(missing_ok=True)
-            raise
-
-        size = tmp_path.stat().st_size
-        if size <= max_bytes:
-            tmp_path.replace(output_path)
-            logger.info(
-                "Processed video: %s -> %s (%d KB, crf=%d)",
-                input_path.name, output_path.name, size // 1024, crf,
-            )
-            return output_path
-
-        logger.debug("Size %d KB at crf %d, re-encoding...", size // 1024, crf)
-        # Keep the last attempt around so we have something if all loops exceed the limit
+        return output_path
+    finally:
+        # Guarantee no leftover temp file in processed/ under any code path
+        # (exception, early return, last-loop promotion). This is the single
+        # place that cleans up last_tmp — everything that owns it sets it to
+        # None once it's been promoted or cleaned up.
         if last_tmp is not None:
             last_tmp.unlink(missing_ok=True)
-        last_tmp = tmp_path
-
-    # All CRF values overshot the budget. Use the largest-CRF (smallest) attempt.
-    assert last_tmp is not None
-    last_tmp.replace(output_path)
-    logger.warning(
-        "Video %s still %d KB at crf 32, keeping anyway",
-        output_path.name, output_path.stat().st_size // 1024,
-    )
-    return output_path
 
 
 def _get_video_dimensions(path: Path) -> tuple[int, int] | None:
