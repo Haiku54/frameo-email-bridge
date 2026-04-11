@@ -10,6 +10,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,7 +28,7 @@ class PushError(AdbError):
 
 
 class FramePusher:
-    def __init__(self, config: dict, archive_dir: Path):
+    def __init__(self, config: dict, archive_dir: Path, config_path: Path | None = None):
         frame_cfg = config["frame"]
         self.ip = frame_cfg["adb_ip"]
         self.port = frame_cfg.get("adb_port", 5555)
@@ -35,6 +37,14 @@ class FramePusher:
         self.push_timeout = frame_cfg.get("push_timeout", 60)
         self.archive_dir = Path(archive_dir)
         self.archive_dir.mkdir(parents=True, exist_ok=True)
+        # Full config + path, used to persist updated IP back to disk
+        # after auto-rediscovery.
+        self._config = config
+        self._config_path = Path(config_path) if config_path else None
+        # Throttle rediscovery attempts so we don't scan the subnet on
+        # every failed push.
+        self._last_rediscovery = 0.0
+        self._rediscovery_cooldown = 60.0  # seconds
 
     def health_check(self) -> bool:
         """Verify ADB is available and frame is reachable."""
@@ -63,30 +73,14 @@ class FramePusher:
         Returns True on success.
         """
         local_path = Path(local_path)
-        remote_path = self.photo_path + local_path.name
-        last_error = None
+        last_error: Exception | None = None
 
+        # Up to 3 attempts at the current IP, then one rediscovery sweep,
+        # then 2 more attempts at the new IP if found.
         for attempt in range(1, 4):
             try:
-                if not self._ensure_connected():
-                    raise FrameConnectionError(f"Cannot connect to {self.device}")
-
-                # Push the file
-                self._run_adb(
-                    "push", str(local_path), remote_path,
-                    timeout=self.push_timeout,
-                )
-
-                # Trigger media scanner so Frameo picks up the new file
-                self._trigger_media_scan(remote_path)
-
-                # Move to archive
-                archive_path = self.archive_dir / local_path.name
-                shutil.move(str(local_path), str(archive_path))
-
-                logger.info("Pushed to frame: %s", local_path.name)
+                self._try_push(local_path)
                 return True
-
             except AdbError as e:
                 last_error = e
                 logger.warning(
@@ -97,10 +91,97 @@ class FramePusher:
                     self._disconnect()
                     time.sleep(5)
 
+        # All attempts at current IP failed — try rediscovering the frame
+        # on the network in case its IP has changed. This handles the
+        # common case where the router reassigns a different IP after a
+        # reboot or DHCP lease renewal.
+        if self._try_rediscover():
+            logger.info("Frame rediscovered at %s, retrying push", self.device)
+            for attempt in range(1, 3):
+                try:
+                    self._try_push(local_path)
+                    return True
+                except AdbError as e:
+                    last_error = e
+                    logger.warning(
+                        "Post-rediscovery push attempt %d/2 failed: %s",
+                        attempt, e,
+                    )
+                    if attempt < 2:
+                        self._disconnect()
+                        time.sleep(3)
+
         logger.error(
             "All push attempts failed for %s: %s", local_path.name, last_error
         )
         return False
+
+    def _try_push(self, local_path: Path) -> None:
+        """Single push attempt. Raises AdbError on any failure."""
+        remote_path = self.photo_path + local_path.name
+        if not self._ensure_connected():
+            raise FrameConnectionError(f"Cannot connect to {self.device}")
+
+        self._run_adb(
+            "push", str(local_path), remote_path,
+            timeout=self.push_timeout,
+        )
+        self._trigger_media_scan(remote_path)
+
+        # Move to archive only after a fully successful push
+        archive_path = self.archive_dir / local_path.name
+        shutil.move(str(local_path), str(archive_path))
+        logger.info("Pushed to frame: %s", local_path.name)
+
+    def _try_rediscover(self) -> bool:
+        """Scan the local network for a Frameo frame and switch to it if found.
+
+        Throttled to once per `_rediscovery_cooldown` seconds so we don't
+        spam network scans on every failed push in a long offline period.
+        Returns True if we switched to a new, reachable IP.
+        """
+        now = time.monotonic()
+        if now - self._last_rediscovery < self._rediscovery_cooldown:
+            logger.debug("Rediscovery skipped (on cooldown)")
+            return False
+        self._last_rediscovery = now
+
+        logger.info("Attempting to rediscover Frameo frame on the network...")
+        try:
+            # Lazy import to avoid a hard dependency cycle at module load time
+            import discover_frame
+            frames = discover_frame.find_frames()
+        except Exception as e:
+            logger.warning("Rediscovery failed: %s", e)
+            return False
+
+        if not frames:
+            logger.warning("Rediscovery did not find any Frameo frames on the network")
+            return False
+
+        new_ip = frames[0]["ip"]
+        if new_ip == self.ip:
+            # Same IP — not a useful rediscovery
+            logger.debug("Rediscovery found same IP %s", new_ip)
+            return False
+
+        logger.info("Frame IP changed: %s -> %s. Updating config.", self.ip, new_ip)
+        self.ip = new_ip
+        self.device = f"{self.ip}:{self.port}"
+        self._config["frame"]["adb_ip"] = new_ip
+        self._persist_config()
+        return True
+
+    def _persist_config(self) -> None:
+        """Write the updated config back to disk so the new IP survives restart."""
+        if not self._config_path:
+            return
+        try:
+            with open(self._config_path, "w") as f:
+                yaml.dump(self._config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            logger.info("Saved updated frame IP to %s", self._config_path)
+        except OSError as e:
+            logger.error("Could not persist config to %s: %s", self._config_path, e)
 
     def _run_adb(self, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
         cmd = ["adb", "-s", self.device] + list(args)

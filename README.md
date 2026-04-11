@@ -19,6 +19,7 @@ Email (photo/video) → Gmail → Poll IMAP → Subject filter → Download
 - **Subject filter**: only process emails with a specific subject line (e.g. "Frameo")
 - **Sender whitelist**: restrict to specific email addresses
 - **Auto-discovery**: finds your frame on the network via port scan (after first USB setup)
+- **Self-healing IP**: if the frame's IP changes (DHCP lease renewal, router reboot, Android MAC randomization), the service automatically rediscovers it on the next push attempt and updates `config.yaml` — no manual intervention needed
 - **Interactive setup**: one command, answers questions, configures everything
 - **Never crashes**: network errors, bad images, frame offline — all handled gracefully
 - **Docker support**: run as a container with `docker compose up -d`
@@ -125,9 +126,34 @@ The setup script tries three methods in order:
 
 ---
 
-## Static IP / DHCP Reservation (IMPORTANT)
+## Handling IP Changes
 
-By default, routers assign IP addresses dynamically (DHCP). Your frame's IP **will** change after a reboot or power outage, which would break the service. **Strongly recommended**: set a DHCP reservation on your router so the frame always gets the same IP.
+Routers assign IP addresses dynamically (DHCP). On Android 10+ frames, **MAC randomization** means the frame can get a new MAC — and therefore a new IP — every time it reconnects to WiFi, even if you set a DHCP reservation in your router.
+
+### Automatic recovery (built in)
+
+The service handles this automatically:
+
+1. When `adb push` fails 3 times in a row (because the frame's IP changed), the service runs `discover_frame.py` internally
+2. The network scanner finds the frame by looking for ADB port 5555 + the Frameo package (`net.frameo.frame`) — it does not care about MAC or IP
+3. If found at a new IP, `config.yaml` is updated in place and the push is retried
+4. Rediscovery is throttled to once per minute so a long offline period doesn't spam the network with scans
+
+You can verify this is working by watching `logs/frameo_bridge.log` — you'll see messages like:
+
+```
+WARNING: Push attempt 3/3 failed for photo.jpg: Cannot connect to 192.168.1.8:5555
+INFO: Attempting to rediscover Frameo frame on the network...
+INFO: Frame IP changed: 192.168.1.8 -> 192.168.1.14. Updating config.
+INFO: Saved updated frame IP to config.yaml
+INFO: Pushed to frame: photo.jpg
+```
+
+**This means you don't strictly need a static IP.** The service will adapt automatically.
+
+### Static IP / DHCP Reservation (optional)
+
+If you still want a fixed IP (faster startup, no rediscovery delay), you can set a DHCP reservation in your router. Note that this only works reliably if you also disable MAC randomization on the frame (see "Step 1" below), otherwise the MAC will keep changing and the reservation will silently stop matching.
 
 ### Step 1: Find the correct MAC address
 

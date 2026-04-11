@@ -37,6 +37,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
+    config_path = Path(args.config)
     base_dir = Path(__file__).parent
 
     # Setup
@@ -54,7 +55,7 @@ def main():
 
     # Initialize modules
     monitor = EmailMonitor(config, dirs["inbox"], dirs["data"] / "processed_emails.db")
-    pusher = FramePusher(config, dirs["archive"])
+    pusher = FramePusher(config, dirs["archive"], config_path=config_path)
 
     # Health check
     if pusher.health_check():
