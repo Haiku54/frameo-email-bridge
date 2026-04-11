@@ -66,6 +66,13 @@ class EmailMonitor:
         conn.commit()
         return conn
 
+    def close(self) -> None:
+        """Close the SQLite connection. Call on shutdown."""
+        try:
+            self.db.close()
+        except Exception as e:
+            logger.debug("Error closing SQLite connection: %s", e)
+
     def check_for_new_photos(self) -> list[DownloadedAttachment]:
         """Poll Gmail for new emails with image attachments.
 
@@ -217,16 +224,18 @@ class EmailMonitor:
                 logger.debug("Skipping video %s (accept_videos is false)", filename)
                 continue
 
-            # Skip inline images (logos, signatures) unless large
-            if is_image and content_id and "inline" in disposition.lower():
-                payload = part.get_payload(decode=True)
-                if payload and len(payload) < 100_000:  # < 100KB
-                    logger.debug("Skipping small inline image: %s", filename)
-                    continue
-
+            # Decode the payload ONCE — calling get_payload(decode=True)
+            # a second time can return None for some encodings under
+            # email.policy.default, silently dropping attachments.
             payload = part.get_payload(decode=True)
             if not payload:
                 continue
+
+            # Skip inline images (logos, signatures) unless large
+            if is_image and content_id and "inline" in disposition.lower():
+                if len(payload) < 100_000:  # < 100KB
+                    logger.debug("Skipping small inline image: %s", filename)
+                    continue
 
             # Sanitize filename
             if not filename:

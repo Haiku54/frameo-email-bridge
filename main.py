@@ -68,23 +68,29 @@ def main():
     processing_config["resolution_width"] = config["frame"].get("resolution_width", 800)
     processing_config["resolution_height"] = config["frame"].get("resolution_height", 480)
 
-    while running:
-        try:
-            count = run_pipeline(monitor, pusher, dirs, processing_config)
-            if count > 0:
-                logger.info("Cycle complete: %d photo(s) pushed", count)
-            else:
-                logger.debug("Cycle complete: no new photos")
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error("Pipeline error: %s", e, exc_info=True)
-
-        # Sleep in 1-second increments for responsive shutdown
-        for _ in range(poll_interval):
-            if not running:
+    try:
+        while running:
+            try:
+                count = run_pipeline(monitor, pusher, dirs, processing_config)
+                if count > 0:
+                    logger.info("Cycle complete: %d photo(s) pushed", count)
+                else:
+                    logger.debug("Cycle complete: no new photos")
+            except KeyboardInterrupt:
                 break
-            time.sleep(1)
+            except Exception as e:
+                logger.error("Pipeline error: %s", e, exc_info=True)
+
+            # Sleep in 1-second increments for responsive shutdown
+            for _ in range(poll_interval):
+                if not running:
+                    break
+                time.sleep(1)
+    finally:
+        # Always close the SQLite connection cleanly so pending transactions
+        # are flushed and the DB file is left in a consistent state, even
+        # if the polling loop crashed.
+        monitor.close()
 
     logger.info("Frameo Email Bridge stopped")
 

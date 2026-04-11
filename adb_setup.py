@@ -256,19 +256,27 @@ def discover_photo_path(device: str) -> str | None:
                 ["adb", "-s", device, "shell", "ls", path],
                 capture_output=True, text=True, timeout=10,
             )
-            if result.returncode == 0:
-                # Test write access
-                test_file = path + ".adb_setup_test"
-                subprocess.run(
-                    ["adb", "-s", device, "shell", "touch", test_file],
-                    capture_output=True, text=True, timeout=10,
-                )
-                subprocess.run(
-                    ["adb", "-s", device, "shell", "rm", test_file],
-                    capture_output=True, text=True, timeout=10,
-                )
-                print(f"  Found writable directory: {path}")
-                return path
+            if result.returncode != 0:
+                continue
+
+            # Verify write access by actually trying to create and remove a file.
+            # Just relying on `ls` succeeding is not sufficient — on some
+            # Android versions /sdcard paths are readable but not writable.
+            test_file = path + ".adb_setup_test"
+            touch_result = subprocess.run(
+                ["adb", "-s", device, "shell", "touch", test_file],
+                capture_output=True, text=True, timeout=10,
+            )
+            # Clean up the test file regardless of whether touch reported success
+            subprocess.run(
+                ["adb", "-s", device, "shell", "rm", "-f", test_file],
+                capture_output=True, text=True, timeout=10,
+            )
+            if touch_result.returncode != 0:
+                # `touch` failed — this directory is not writable
+                continue
+            print(f"  Found writable directory: {path}")
+            return path
         except subprocess.TimeoutExpired:
             continue
     return None
@@ -295,7 +303,12 @@ def update_config(ip: str, port: int, photo_path: str) -> None:
 
 def run_adb(serial: str, *args: str) -> str:
     cmd = ["adb", "-s", serial] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ADB command timed out after 30s: {' '.join(cmd)}")
+    except FileNotFoundError:
+        raise RuntimeError("adb is not installed on this system")
     return result.stdout
 
 
