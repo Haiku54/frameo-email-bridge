@@ -136,10 +136,13 @@ def main() -> None:
     print("=" * 60)
     print()
     print("  Next steps:")
-    print("    - Run manually:  python main.py")
-    print("    - Run as service: see README.md for systemd/Docker setup")
-    print("    - IMPORTANT: set a static IP / DHCP reservation on your router")
-    print(f"      for the frame ({frame_info['ip']}) so it doesn't change.")
+    print("    - Run manually:       .venv/bin/python main.py")
+    print("    - Run as a service:   see README.md (systemd / Docker)")
+    print()
+    print("  Note: if the frame's IP changes (DHCP renewal, router reboot,")
+    print("  Android MAC randomization), the service will auto-rediscover it")
+    print("  on the next push and update config.yaml — no action needed.")
+    print("  A static IP / DHCP reservation is optional.")
     print()
 
 
