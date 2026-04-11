@@ -69,15 +69,23 @@ def main():
     processing_config["resolution_width"] = config["frame"].get("resolution_width", 800)
     processing_config["resolution_height"] = config["frame"].get("resolution_height", 480)
 
-    # Crash recovery: if a previous run was killed between downloading an
-    # attachment and processing it, the file is sitting in inbox/ but its
-    # UID is already in the SQLite DB (so IMAP won't re-deliver it). Process
-    # those orphans now before entering the normal poll loop.
-    orphan_count = _process_inbox_orphans(pusher, dirs, processing_config)
-    if orphan_count > 0:
-        logger.info("Recovered %d orphaned file(s) from inbox/ on startup", orphan_count)
-
     try:
+        # Crash recovery: if a previous run was killed between downloading
+        # an attachment and processing it, the file is sitting in inbox/
+        # but its UID is already in the SQLite DB (so IMAP won't re-deliver
+        # it). Process those orphans now before entering the normal poll
+        # loop. Must be inside the try/finally so monitor.close() still
+        # runs if orphan recovery fails (e.g. SD card error).
+        try:
+            orphan_count = _process_inbox_orphans(pusher, dirs, processing_config)
+            if orphan_count > 0:
+                logger.info(
+                    "Recovered %d orphaned file(s) from inbox/ on startup",
+                    orphan_count,
+                )
+        except OSError as e:
+            logger.error("Orphan recovery failed (continuing anyway): %s", e)
+
         while running:
             try:
                 count = run_pipeline(monitor, pusher, dirs, processing_config)

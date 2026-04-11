@@ -247,6 +247,17 @@ class EmailMonitor:
             safe_name = SAFE_FILENAME_RE.sub("_", filename)
             save_path = self.inbox_dir / f"{uid}_{safe_name}"
 
+            # Disambiguate if two attachments in the same email share
+            # the same sanitized filename. Without this the second write
+            # would silently overwrite the first.
+            if save_path.exists():
+                stem = Path(safe_name).stem
+                suffix = Path(safe_name).suffix
+                counter = 1
+                while save_path.exists():
+                    save_path = self.inbox_dir / f"{uid}_{counter}_{stem}{suffix}"
+                    counter += 1
+
             save_path.write_bytes(payload)
             attachments.append(DownloadedAttachment(
                 file_path=save_path,
