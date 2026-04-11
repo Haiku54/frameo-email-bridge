@@ -127,11 +127,34 @@ The setup script tries three methods in order:
 
 ## Static IP / DHCP Reservation (IMPORTANT)
 
-By default, routers assign IP addresses dynamically (DHCP). Your frame's IP might change after a reboot or power outage, which would break the service. **Strongly recommended**: set a static IP / DHCP reservation in your router.
+By default, routers assign IP addresses dynamically (DHCP). Your frame's IP **will** change after a reboot or power outage, which would break the service. **Strongly recommended**: set a DHCP reservation on your router so the frame always gets the same IP.
 
-### How to do it
+### Step 1: Find the correct MAC address
 
-Log into your router (usually `http://192.168.1.1` or `http://192.168.1.254`) and find the DHCP settings:
+> **WARNING — Android MAC randomization:** Most Frameo frames run Android 10+, which uses a **randomized MAC per WiFi network** by default (for privacy). This means the MAC address that the router sees is **NOT** the hardware MAC printed on the frame or reported by `cat /sys/class/net/wlan0/address`. If you use the wrong MAC in the reservation, the router will simply ignore it.
+>
+> The MAC you need is whatever **the router actually sees** for this frame on this network.
+
+The most reliable method — **read it directly from the router**:
+
+1. Log into your router's admin page (usually `http://192.168.1.1` or `http://192.168.1.254`)
+2. Find the page showing connected clients / DHCP leases (names vary: "Device list", "Connected devices", "DHCP Clients", "Attached devices")
+3. Look for a device whose host name contains `android-...` or whose IP matches the one the service is currently using
+4. Copy the MAC address shown in that row — this is the MAC you need
+
+Alternative method — ADB (useful for cross-checking):
+
+```bash
+adb -s <frame-ip>:5555 shell ip link show wlan0
+```
+
+Look for the line starting with `link/ether XX:XX:XX:XX:XX:XX` — **this may or may not match what the router sees**, depending on the frame's MAC-randomization setting. If the two don't match, **trust the router's view**.
+
+Do NOT use the output of `cat /sys/class/net/wlan0/address` — on some Android versions this returns the hardware MAC, not the effective MAC used on the network.
+
+### Step 2: Create the reservation
+
+Find the DHCP reservation page in your router admin:
 
 | Router brand | Path |
 |-------------|------|
@@ -139,21 +162,37 @@ Log into your router (usually `http://192.168.1.1` or `http://192.168.1.254`) an
 | **TP-Link** | DHCP → Address Reservation |
 | **D-Link** | Setup → Network Settings → Add DHCP Reservation |
 | **Netgear** | LAN Setup → Address Reservation |
-| **Bezeq / HOT** | Advanced → DHCP → Static IP Assignment |
+| **Bezeq / HOT / Partner / Cellcom** | Advanced → DHCP → Static IP Assignment |
 | **Huawei** | LAN → LAN Settings → DHCP Static Address |
 
 Steps:
-1. Find the Frameo frame in the list of connected devices (usually `K1003T` or `Frameo`)
-2. Copy its MAC address
-3. Assign it a static IP (e.g. `192.168.1.200`)
-4. Save and reboot the frame
+1. Enter the MAC address from Step 1
+2. Assign a static IP outside the DHCP pool, or any unused IP (e.g. `192.168.1.200`)
+3. Save the reservation
 
-After this, the frame always gets the same IP and you never need to re-run configure.py because of an IP change.
+### Step 3: Force the frame to pick up the new reservation
 
-**Find the MAC address** with:
+The router will only apply the reservation on the **next DHCP lease request**. The current lease is still valid, so nothing changes until you do one of these:
+
+- **Easiest:** delete the current DHCP lease for the frame from the router's "Connected devices" / "DHCP client list" page (most routers have a "Release" or "Delete" button on each row)
+- **Or:** reboot the frame (power cycle or `adb -s <frame-ip>:5555 reboot`)
+- **Or:** toggle WiFi off and on in the frame's Settings → WiFi screen
+- **Or:** just wait — the lease will expire after a few hours and the frame will renew with the new IP
+
+### Step 4: Verify
+
 ```bash
-adb -s <frame-ip>:5555 shell cat /sys/class/net/wlan0/address
+source .venv/bin/activate
+python discover_frame.py
 ```
+
+The scanner should now find the frame at the IP you reserved. If the IP matches what you set in the router, re-run `python configure.py` — it will auto-update `config.yaml` with the new IP.
+
+### If the reservation doesn't work
+
+- **MAC mismatch:** this is the #1 issue. Double-check that the MAC you entered in the router exactly matches what the router sees in its own client list (including case and separators — some routers want `AA:BB:CC:DD:EE:FF`, others `AA-BB-CC-DD-EE-FF`).
+- **MAC randomization keeps changing:** if the MAC the router sees changes each time the frame reconnects, go into the frame's WiFi settings and change **MAC type / Privacy → "Use device MAC"** (not "Randomized MAC") for that specific network. Then re-check the MAC in the router and update the reservation if it changed.
+- **Lease not released:** if the reservation is correct but the frame still has the old IP, the old lease is still held. Delete it manually in the router.
 
 ---
 
