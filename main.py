@@ -19,6 +19,7 @@ from email_monitor import EmailMonitor
 from frame_pusher import FramePusher
 from image_processor import ImageProcessingError, HeicNotSupportedError, process_image
 from video_processor import (
+    VIDEO_EXTENSIONS,
     FfmpegNotInstalledError,
     VideoProcessingError,
     process_video,
@@ -68,6 +69,14 @@ def main():
     processing_config["resolution_width"] = config["frame"].get("resolution_width", 800)
     processing_config["resolution_height"] = config["frame"].get("resolution_height", 480)
 
+    # Crash recovery: if a previous run was killed between downloading an
+    # attachment and processing it, the file is sitting in inbox/ but its
+    # UID is already in the SQLite DB (so IMAP won't re-deliver it). Process
+    # those orphans now before entering the normal poll loop.
+    orphan_count = _process_inbox_orphans(pusher, dirs, processing_config)
+    if orphan_count > 0:
+        logger.info("Recovered %d orphaned file(s) from inbox/ on startup", orphan_count)
+
     try:
         while running:
             try:
@@ -95,6 +104,82 @@ def main():
     logger.info("Frameo Email Bridge stopped")
 
 
+def _process_one_file(
+    input_path: Path,
+    output_stem: str,
+    is_video: bool,
+    pusher: FramePusher,
+    dirs: dict,
+    processing_config: dict,
+) -> tuple[bool, str | None]:
+    """Process and push a single file from inbox/.
+
+    Returns (pushed, output_name). output_name is the name of the file that
+    was produced in processed/ (None if processing failed).
+    """
+    if is_video:
+        output_name = f"{output_stem}.mp4"
+        output_path = dirs["processed"] / output_name
+        try:
+            process_video(input_path, output_path, processing_config)
+        except FfmpegNotInstalledError as e:
+            logger.error("%s — moving to failed/", e)
+            _move_to_failed(input_path, dirs["failed"])
+            return False, None
+        except VideoProcessingError as e:
+            logger.error("Video processing failed for %s: %s", input_path.name, e)
+            _move_to_failed(input_path, dirs["failed"])
+            return False, None
+    else:
+        output_name = f"{output_stem}.jpg"
+        output_path = dirs["processed"] / output_name
+        try:
+            process_image(input_path, output_path, processing_config)
+        except HeicNotSupportedError as e:
+            logger.warning("%s — moving to failed/", e)
+            _move_to_failed(input_path, dirs["failed"])
+            return False, None
+        except ImageProcessingError as e:
+            logger.error("Image processing failed for %s: %s", input_path.name, e)
+            _move_to_failed(input_path, dirs["failed"])
+            return False, None
+
+    # Remove original from inbox
+    try:
+        input_path.unlink()
+    except OSError:
+        pass
+
+    pushed = pusher.push_photo(output_path)
+    return pushed, output_name
+
+
+def _process_inbox_orphans(
+    pusher: FramePusher,
+    dirs: dict,
+    processing_config: dict,
+) -> int:
+    """Process any files left in inbox/ from a previous crashed run.
+
+    Without this, a file saved to inbox/ whose UID was already committed to
+    the SQLite DB would be orphaned forever — IMAP won't re-deliver it and
+    the normal polling loop only sees new UNSEEN emails.
+    """
+    processed = 0
+    for orphan in sorted(dirs["inbox"].iterdir()):
+        if not orphan.is_file():
+            continue
+        logger.warning("Recovering orphaned file from prior crash: %s", orphan.name)
+        is_video = orphan.suffix.lower() in VIDEO_EXTENSIONS
+        stem = orphan.stem
+        pushed, _ = _process_one_file(
+            orphan, stem, is_video, pusher, dirs, processing_config
+        )
+        if pushed:
+            processed += 1
+    return processed
+
+
 def run_pipeline(
     monitor: EmailMonitor,
     pusher: FramePusher,
@@ -104,54 +189,25 @@ def run_pipeline(
     """Run one polling cycle: email -> download -> process -> push."""
     attachments = monitor.check_for_new_photos()
     pushed = 0
-    current_outputs = set()
+    current_outputs: set[str] = set()
 
     for att in attachments:
-        stem = Path(att.original_filename).stem
-
-        if att.is_video:
-            output_name = f"{att.uid}_{stem}.mp4"
-            output_path = dirs["processed"] / output_name
-            try:
-                process_video(att.file_path, output_path, processing_config)
-            except FfmpegNotInstalledError as e:
-                logger.error("%s — moving to failed/", e)
-                _move_to_failed(att.file_path, dirs["failed"])
-                continue
-            except VideoProcessingError as e:
-                logger.error("Video processing failed for %s: %s", att.original_filename, e)
-                _move_to_failed(att.file_path, dirs["failed"])
-                continue
-        else:
-            output_name = f"{att.uid}_{stem}.jpg"
-            output_path = dirs["processed"] / output_name
-            try:
-                process_image(att.file_path, output_path, processing_config)
-            except HeicNotSupportedError as e:
-                logger.warning("%s — moving to failed/", e)
-                _move_to_failed(att.file_path, dirs["failed"])
-                continue
-            except ImageProcessingError as e:
-                logger.error("Image processing failed for %s: %s", att.original_filename, e)
-                _move_to_failed(att.file_path, dirs["failed"])
-                continue
-
-        current_outputs.add(output_path.name)
-
-        # Remove original from inbox
-        try:
-            att.file_path.unlink()
-        except OSError:
-            pass
-
-        # Push to frame
-        if pusher.push_photo(output_path):
+        stem = f"{att.uid}_{Path(att.original_filename).stem}"
+        was_pushed, output_name = _process_one_file(
+            att.file_path, stem, att.is_video, pusher, dirs, processing_config
+        )
+        if output_name:
+            current_outputs.add(output_name)
+        if was_pushed:
             pushed += 1
-        # If push fails, file stays in processed/ for next cycle
 
     # Retry any previously failed pushes sitting in processed/
     for leftover in list(dirs["processed"].glob("*.jpg")) + list(dirs["processed"].glob("*.mp4")):
         if leftover.name in current_outputs:
+            continue
+        # Skip tempfile.mkstemp leftovers (should never happen after round 2 fix,
+        # but defensive — they start with "tmp" and are short names)
+        if leftover.name.startswith("tmp") and len(leftover.stem) < 12:
             continue
         logger.info("Retrying previously failed push: %s", leftover.name)
         if pusher.push_photo(leftover):
