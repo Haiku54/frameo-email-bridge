@@ -11,7 +11,7 @@ import imaplib
 import logging
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,27 @@ class EmailMonitor:
         self.inbox_dir = Path(inbox_dir)
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
         self.db = self._init_db(db_path)
+        self._baseline_initialized = self._check_baseline()
+
+    def _check_baseline(self) -> bool:
+        """Has the DB been initialized with the baseline of existing UIDs?
+
+        We set a meta row the first time we sync the full inbox history.
+        Until then, the first poll will mark everything currently in the
+        inbox as already-processed so we don't flood the frame with the
+        user's entire email history on first run.
+        """
+        row = self.db.execute(
+            "SELECT value FROM meta WHERE key = 'baseline_synced'"
+        ).fetchone()
+        return row is not None and row[0] == "1"
+
+    def _set_baseline_synced(self) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('baseline_synced', '1')"
+        )
+        self.db.commit()
+        self._baseline_initialized = True
 
     def _init_db(self, db_path: Path) -> sqlite3.Connection:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -61,6 +82,12 @@ class EmailMonitor:
                 subject TEXT,
                 attachment_count INTEGER,
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         """)
         conn.commit()
@@ -76,31 +103,47 @@ class EmailMonitor:
     def check_for_new_photos(self) -> list[DownloadedAttachment]:
         """Poll Gmail for new emails with image attachments.
 
+        Strategy: do NOT rely on the IMAP \\Seen flag. Other Gmail clients
+        (phone app, another browser tab, filter rules, notification preview)
+        can mark emails as read before we get to them. Instead, ask Gmail for
+        all recent emails (last N days) and filter out UIDs we have already
+        processed based on our own SQLite database. This makes the service
+        independent of whatever else is touching the inbox.
+
         Returns a list of downloaded attachments saved to inbox_dir.
         """
         conn = None
         attachments = []
         try:
             conn = self._connect()
-            uids = self._search_unseen(conn)
-            if not uids:
-                logger.debug("No new unread emails")
+
+            # First-run baseline: mark every existing inbox email as already
+            # processed so we don't dump the user's entire history onto the
+            # frame. Only new emails from this moment forward will be sent.
+            if not self._baseline_initialized:
+                self._initialize_baseline(conn)
+
+            uids = self._search_recent(conn)
+            # Filter out UIDs we already handled. This is the single source
+            # of truth for "already processed".
+            new_uids = [u for u in uids if not self._is_uid_processed(u)]
+            if not new_uids:
+                logger.debug("No new unprocessed emails (checked %d recent)", len(uids))
                 return []
 
-            logger.info("Found %d new unread email(s)", len(uids))
+            logger.info(
+                "Found %d new email(s) to process (out of %d recent)",
+                len(new_uids), len(uids),
+            )
 
-            for uid in uids:
-                if self._is_uid_processed(uid):
-                    logger.debug("UID %s already processed, skipping", uid)
-                    continue
+            for uid in new_uids:
                 try:
                     msg_attachments = self._process_email(conn, uid)
                     attachments.extend(msg_attachments)
                 except (ConnectionResetError, TimeoutError, OSError, imaplib.IMAP4.error) as e:
                     # Transient network/protocol errors: leave UID unmarked so
-                    # the next polling cycle will retry (email is still UNSEEN).
+                    # the next polling cycle will retry.
                     logger.warning("Transient error on UID %s, will retry next cycle: %s", uid, e)
-                    # Bail out of the loop — the connection is likely broken anyway
                     raise
                 except Exception as e:
                     # Structural/parse errors (malformed email etc.) — mark as
@@ -132,8 +175,34 @@ class EmailMonitor:
         except Exception:
             pass
 
-    def _search_unseen(self, conn: imaplib.IMAP4_SSL) -> list[str]:
-        status, data = conn.uid("search", None, "UNSEEN")
+    def _initialize_baseline(self, conn: imaplib.IMAP4_SSL) -> None:
+        """On first run, mark every current inbox email as already processed.
+
+        Without this, a fresh install would immediately push every photo in
+        the user's entire email history to the frame.
+        """
+        logger.info("First run: marking existing inbox as baseline (will not be processed)")
+        status, data = conn.uid("search", None, "ALL")
+        if status != "OK":
+            logger.warning("Baseline SEARCH ALL failed, baseline skipped")
+            return
+        existing = data[0].decode().split() if data[0] else []
+        for uid in existing:
+            self._mark_uid_processed(uid, "", "", 0)
+        self._set_baseline_synced()
+        logger.info(
+            "Baseline marked %d existing email(s) as processed", len(existing)
+        )
+
+    def _search_recent(self, conn: imaplib.IMAP4_SSL, days: int = 2) -> list[str]:
+        """Return UIDs of all emails received in the last `days` days.
+
+        Uses IMAP SEARCH SINCE which is supported by all servers. The service
+        then filters these UIDs against its own SQLite database of already-
+        processed emails, so it does NOT depend on the \\Seen flag.
+        """
+        since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+        status, data = conn.uid("search", None, "SINCE", since)
         if status != "OK" or not data[0]:
             return []
         return data[0].decode().split()
@@ -141,12 +210,26 @@ class EmailMonitor:
     def _process_email(
         self, conn: imaplib.IMAP4_SSL, uid: str
     ) -> list[DownloadedAttachment]:
-        status, data = conn.uid("fetch", uid, "(RFC822)")
+        # BODY.PEEK[] fetches the message without setting the \Seen flag,
+        # so if another client later reads the email it'll look unread as
+        # the user expects. Processing tracking happens entirely in our
+        # SQLite database.
+        status, data = conn.uid("fetch", uid, "(BODY.PEEK[])")
         if status != "OK":
             logger.warning("Failed to fetch UID %s", uid)
             return []
 
-        raw = data[0][1]
+        # data structure: [(header_info_bytes, body_bytes), b')']
+        # find the tuple with the payload
+        raw = None
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2:
+                raw = item[1]
+                break
+        if raw is None:
+            logger.warning("Could not locate message body for UID %s", uid)
+            return []
+
         msg = email.message_from_bytes(raw, policy=email.policy.default)
 
         sender = msg.get("From", "")
@@ -157,7 +240,6 @@ class EmailMonitor:
 
         if not self._is_sender_allowed(sender_addr):
             logger.info("Sender %s not in whitelist, skipping", sender_addr)
-            conn.uid("store", uid, "+FLAGS", "\\Seen")
             self._mark_uid_processed(uid, sender_addr, subject, 0)
             return []
 
@@ -166,14 +248,12 @@ class EmailMonitor:
                 "Subject %r does not match filter %r, skipping",
                 subject, self.subject_filter,
             )
-            conn.uid("store", uid, "+FLAGS", "\\Seen")
             self._mark_uid_processed(uid, sender_addr, subject, 0)
             return []
 
         attachments = self._extract_attachments(msg, uid, sender_addr)
 
-        # Mark email as read
-        conn.uid("store", uid, "+FLAGS", "\\Seen")
+        # Record UID in our DB — this is the only dedup mechanism now.
         self._mark_uid_processed(uid, sender_addr, subject, len(attachments))
 
         if attachments:
