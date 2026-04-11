@@ -125,8 +125,12 @@ def _save_within_size_limit(
 ) -> None:
     """Save as JPEG, reducing quality iteratively if file exceeds max size."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    quality = initial_quality
+    # Clamp to a safe range so the loop always runs at least once even if
+    # the user configured jpeg_quality outside 30-100.
+    quality = max(30, min(100, int(initial_quality)))
 
+    buf = BytesIO()
+    size = 0
     while quality >= 30:
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
