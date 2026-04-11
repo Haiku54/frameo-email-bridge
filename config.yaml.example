@@ -1,0 +1,29 @@
+email:
+  imap_server: imap.gmail.com
+  imap_port: 993
+  username: ""                    # Your Gmail address
+  password: ""                    # Gmail App Password (NOT your regular password)
+  poll_interval_seconds: 120      # How often to check for new emails
+  subject_filter: ""              # Only emails with this subject are processed. Empty = accept all subjects.
+  allowed_senders: []             # Empty = accept from all senders. Example: ["mom@example.com", "dad@example.com"]
+
+frame:
+  adb_ip: ""                      # Frame's WiFi IP (set automatically by configure.py)
+  adb_port: 5555
+  photo_path: "/sdcard/DCIM/"     # Frameo reads photos/videos from here
+  resolution_width: 1280          # Auto-detected by configure.py via `adb shell wm size`
+  resolution_height: 800
+
+processing:
+  # Image settings
+  max_file_size_mb: 2
+  jpeg_quality: 95
+  strip_exif: true
+  convert_heic: true
+
+  # Video settings
+  accept_videos: true                 # Set to false to ignore video attachments
+  max_video_duration_seconds: 10      # Videos longer than this are trimmed. WARNING: Frameo frames have
+                                      # different max durations — typically 10-15 seconds. Check your
+                                      # frame's specifications. If unsure, start with 10.
+  video_max_file_size_mb: 20          # Max output video file size

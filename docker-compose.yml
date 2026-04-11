@@ -1,0 +1,11 @@
+services:
+  frameo-bridge:
+    build: .
+    container_name: frameo-bridge
+    restart: unless-stopped
+    network_mode: host        # Required for ADB to reach the frame on local network
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./archive:/app/archive

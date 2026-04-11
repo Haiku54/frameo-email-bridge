@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# Config with credentials
+config.yaml
+
+# Runtime directories (contain user photos, videos, logs)
+inbox/
+processed/
+archive/
+logs/
+data/
+
+# Log files
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts
+Screenshot*.png
+test_*.jpg
+test_*.mp4
+*.bak
