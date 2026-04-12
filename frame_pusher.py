@@ -252,6 +252,52 @@ class FramePusher:
         except Exception:
             pass
 
+    def list_remote_files(self, remote_path: str | None = None) -> list[str] | None:
+        """List files in a directory on the frame via ADB.
+
+        Args:
+            remote_path: Directory to list. Defaults to self.photo_path.
+
+        Returns a list of filenames, or None if ADB fails.
+        """
+        path = remote_path or self.photo_path
+        try:
+            if not self._ensure_connected():
+                return None
+            result = self._run_adb("shell", "ls", path, timeout=30)
+            return [
+                name.strip()
+                for name in result.stdout.strip().splitlines()
+                if name.strip() and not name.strip().startswith(".")
+            ]
+        except AdbError as e:
+            logger.warning("Could not list frame files at %s: %s", path, e)
+            return None
+
+    def pull_file(
+        self, remote_filename: str, local_path: Path,
+        remote_path: str | None = None,
+    ) -> bool:
+        """Pull a single file from the frame to a local path.
+
+        Args:
+            remote_filename: Name of the file on the frame.
+            local_path: Where to save locally.
+            remote_path: Directory on frame. Defaults to self.photo_path.
+        """
+        path = remote_path or self.photo_path
+        try:
+            if not self._ensure_connected():
+                return False
+            self._run_adb(
+                "pull", path + remote_filename, str(local_path),
+                timeout=self.push_timeout,
+            )
+            return True
+        except AdbError as e:
+            logger.warning("Could not pull %s from frame: %s", remote_filename, e)
+            return False
+
     def _trigger_media_scan(self, remote_path: str) -> None:
         """Tell Android's MediaStore to scan the new file so Frameo sees it."""
         try:

@@ -29,4 +29,17 @@ if [ ! -f /app/config.yaml ]; then
     exit 1
 fi
 
+# Warn if Google Photos sync is enabled but credentials.json is missing.
+# Non-fatal: the service will start but GP sync will be disabled at runtime.
+if grep -q "enabled: true" /app/config.yaml 2>/dev/null; then
+    if [ ! -f /app/credentials.json ]; then
+        echo "WARNING: google_photos is enabled but credentials.json is not mounted." >&2
+        echo "Google Photos sync will be disabled. To fix:" >&2
+        echo "  1. Place credentials.json in the project directory" >&2
+        echo "  2. Run: python google_photos.py --auth (on the host)" >&2
+        echo "  3. Restart the container" >&2
+        echo "" >&2
+    fi
+fi
+
 exec python main.py

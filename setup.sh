@@ -67,7 +67,7 @@ echo
 echo "  Installing Python dependencies..."
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
-echo "  Dependencies installed"
+echo "  Dependencies installed (includes Google Photos sync libraries)"
 
 # --- Create runtime directories ---
 echo

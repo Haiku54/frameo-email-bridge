@@ -29,3 +29,17 @@ processing:
                                       # different max durations — typically 10-15 seconds. Check your
                                       # frame's specifications. If unsure, start with 10.
   video_max_file_size_mb: 20          # Max output video file size
+
+# Google Photos sync (optional)
+# Syncs photos pushed to the frame to a shared Google Photos album for viewing.
+# Family members can view the album via a shared link — no app install needed.
+# Requires a Google Cloud project with the Photos Library API enabled.
+# Run `python google_photos.py --auth` once to authorize.
+google_photos:
+  enabled: false
+  credentials_file: "credentials.json"    # OAuth2 client credentials from Google Cloud Console
+  album_name: "Frameo Photos"             # Album name (created automatically if it doesn't exist)
+  full_sync_time: "03:00"                 # Daily full sync with frame (24h format, e.g. "03:00")
+  archive_retention_days: 7               # Delete archived files after this many days
+                                          # (only files confirmed uploaded to Google Photos).
+                                          # Set to 0 to keep forever.

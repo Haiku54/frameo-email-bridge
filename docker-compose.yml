@@ -20,3 +20,6 @@ services:
       - ./archive:/app/archive
       - ./logs:/app/logs
       - ./data:/app/data
+      # Google Photos sync (optional) — only needed if google_photos.enabled
+      # is true in config.yaml. Remove this line if not using GP sync.
+      - ./credentials.json:/app/credentials.json:ro

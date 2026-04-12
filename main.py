@@ -7,9 +7,11 @@ to a Frameo digital photo frame via ADB over WiFi.
 
 import argparse
 import logging
+import shutil
 import signal
 import sys
 import time
+from datetime import datetime, date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -17,6 +19,7 @@ import yaml
 
 from email_monitor import EmailMonitor
 from frame_pusher import FramePusher
+from google_photos import GooglePhotosSync
 from image_processor import ImageProcessingError, HeicNotSupportedError, process_image
 from video_processor import (
     VIDEO_EXTENSIONS,
@@ -57,6 +60,20 @@ def main():
     monitor = EmailMonitor(config, dirs["inbox"], dirs["data"] / "processed_emails.db")
     pusher = FramePusher(config, dirs["archive"], config_path=config_path)
 
+    # Initialize Google Photos sync (optional)
+    gp_sync = None
+    gp_config = config.get("google_photos", {})
+    if gp_config.get("enabled", False):
+        gp_sync = GooglePhotosSync(config, dirs["data"])
+        if gp_sync.authenticate():
+            logger.info(
+                "Google Photos sync enabled, album: %s",
+                gp_config.get("album_name", "Frameo Photos"),
+            )
+        else:
+            logger.warning("Google Photos auth failed — sync disabled")
+            gp_sync = None
+
     # Health check
     if pusher.health_check():
         logger.info("Frame health check passed")
@@ -69,6 +86,11 @@ def main():
     # Pass frame resolution into processing config for image_processor
     processing_config["resolution_width"] = config["frame"].get("resolution_width", 800)
     processing_config["resolution_height"] = config["frame"].get("resolution_height", 480)
+
+    # Daily full sync tracking — initialize to today so we don't trigger
+    # on every restart. The sync will fire tomorrow at full_sync_time.
+    full_sync_time = gp_config.get("full_sync_time", "03:00") if gp_sync else None
+    last_full_sync_date: date | None = date.today() if gp_sync else None
 
     try:
         # Crash recovery: if a previous run was killed between downloading
@@ -89,7 +111,9 @@ def main():
 
         while running:
             try:
-                count = run_pipeline(monitor, pusher, dirs, processing_config)
+                count = run_pipeline(
+                    monitor, pusher, dirs, processing_config, gp_sync,
+                )
                 if count > 0:
                     logger.info("Cycle complete: %d photo(s) pushed", count)
                 else:
@@ -99,16 +123,40 @@ def main():
             except Exception as e:
                 logger.error("Pipeline error: %s", e, exc_info=True)
 
+            # Daily Google Photos full sync
+            if gp_sync and full_sync_time:
+                now = datetime.now()
+                if (
+                    now.strftime("%H:%M") >= full_sync_time
+                    and last_full_sync_date != now.date()
+                ):
+                    try:
+                        _run_full_sync(gp_sync, pusher, dirs)
+                    except Exception as e:
+                        logger.error("Full sync failed: %s", e, exc_info=True)
+                    # Clean up old archives confirmed in Google Photos
+                    retention = gp_config.get("archive_retention_days", 7)
+                    if retention > 0:
+                        try:
+                            _cleanup_old_archives(gp_sync, dirs["archive"], retention)
+                        except Exception as e:
+                            logger.error("Archive cleanup failed: %s", e)
+                    # Mark today as done even on failure — individual files
+                    # that failed will be retried via _retry_gp_uploads each
+                    # cycle, and a full re-sync will run tomorrow.
+                    last_full_sync_date = now.date()
+
             # Sleep in 1-second increments for responsive shutdown
             for _ in range(poll_interval):
                 if not running:
                     break
                 time.sleep(1)
     finally:
-        # Always close the SQLite connection cleanly so pending transactions
-        # are flushed and the DB file is left in a consistent state, even
-        # if the polling loop crashed.
+        # Always close connections cleanly so pending transactions are
+        # flushed and DB files are left in a consistent state.
         monitor.close()
+        if gp_sync:
+            gp_sync.close()
 
     logger.info("Frameo Email Bridge stopped")
 
@@ -194,6 +242,7 @@ def run_pipeline(
     pusher: FramePusher,
     dirs: dict,
     processing_config: dict,
+    gp_sync: GooglePhotosSync | None = None,
 ) -> int:
     """Run one polling cycle: email -> download -> process -> push."""
     attachments = monitor.check_for_new_photos()
@@ -209,6 +258,9 @@ def run_pipeline(
             current_outputs.add(output_name)
         if was_pushed:
             pushed += 1
+            # Immediate upload to Google Photos
+            if gp_sync and output_name:
+                _gp_upload_safe(gp_sync, dirs["archive"] / output_name)
 
     # Retry any previously failed pushes sitting in processed/
     for leftover in list(dirs["processed"].glob("*.jpg")) + list(dirs["processed"].glob("*.mp4")):
@@ -221,8 +273,184 @@ def run_pipeline(
         logger.info("Retrying previously failed push: %s", leftover.name)
         if pusher.push_photo(leftover):
             pushed += 1
+            if gp_sync:
+                _gp_upload_safe(gp_sync, pusher.archive_dir / leftover.name)
+
+    # Retry any Google Photos uploads that previously failed
+    if gp_sync:
+        _retry_gp_uploads(gp_sync, dirs["archive"])
 
     return pushed
+
+
+def _gp_upload_safe(gp_sync: GooglePhotosSync, archive_path: Path) -> None:
+    """Upload a file to Google Photos, logging but never raising on failure."""
+    try:
+        gp_sync.upload_file(archive_path)
+    except Exception as e:
+        logger.warning(
+            "Google Photos upload failed for %s (will retry): %s",
+            archive_path.name, e,
+        )
+
+
+def _retry_gp_uploads(gp_sync: GooglePhotosSync, archive_dir: Path) -> None:
+    """Upload any archived files that are not yet in Google Photos."""
+    uploaded = gp_sync.get_uploaded_files()
+    for f in sorted(archive_dir.iterdir()):
+        if not f.is_file():
+            continue
+        if f.suffix.lower() not in (".jpg", ".mp4"):
+            continue
+        if f.name in uploaded:
+            continue
+        if f.name.startswith("_configure_test"):
+            continue
+        # Skip files that were removed from the album (deleted from frame)
+        if gp_sync.is_removed(f.name):
+            continue
+        if not gp_sync.upload_file(f):
+            break  # Don't hammer the API if it's down
+
+
+def _run_full_sync(
+    gp_sync: GooglePhotosSync,
+    pusher: FramePusher,
+    dirs: dict,
+) -> None:
+    """Daily sync: reconcile frame contents with Google Photos album."""
+    logger.info("Starting daily Google Photos full sync")
+
+    # 1. List files on frame — scan both the push directory and the
+    #    Frameo app's own media directory (photos sent via the phone app).
+    FRAME_MEDIA_PATHS = [
+        None,                           # pusher.photo_path (DCIM)
+        "/sdcard/frameo_files/media/",   # Frameo app's media
+    ]
+    frame_files: dict[str, str | None] = {}  # {filename: remote_path}
+    any_path_failed = False
+    for rpath in FRAME_MEDIA_PATHS:
+        files = pusher.list_remote_files(remote_path=rpath)
+        if files is None:
+            # ADB failure on this path — mark as incomplete
+            any_path_failed = True
+            continue
+        for f in files:
+            # Prefix with path to avoid collisions between directories
+            key = f"{rpath or 'dcim'}:{f}"
+            frame_files[key] = rpath
+
+    if not frame_files and any_path_failed:
+        logger.warning("Could not list frame files, skipping full sync")
+        return
+
+    # 2. Get what we've uploaded (from SQLite)
+    uploaded = gp_sync.get_uploaded_files()
+
+    # Only consider photo/video files (ls may include subdirs and other files)
+    photo_extensions = {".jpg", ".jpeg", ".mp4"}
+    # frame_files is {key: remote_path} where key = "path:filename"
+    # Extract just the filename part for comparison with uploaded DB
+    frame_by_name: dict[str, str | None] = {}  # {filename: remote_path}
+    for key, rpath in frame_files.items():
+        # key is "path:filename" — extract filename
+        filename = key.split(":", 1)[1] if ":" in key else key
+        if Path(filename).suffix.lower() in photo_extensions:
+            # If collision, keep the first one seen (DCIM takes priority)
+            if filename not in frame_by_name:
+                frame_by_name[filename] = rpath
+
+    frame_set = set(frame_by_name.keys())
+    uploaded_set = set(uploaded.keys())
+
+    # 3. Files on frame but NOT in album → upload
+    missing_from_album = frame_set - uploaded_set
+    if missing_from_album:
+        logger.info(
+            "Full sync: %d file(s) on frame not in album", len(missing_from_album),
+        )
+        for filename in sorted(missing_from_album):
+            # Check archive first (common: pushed by us but GP upload failed)
+            archive_path = dirs["archive"] / filename
+            if archive_path.exists():
+                try:
+                    gp_sync.upload_file(archive_path)
+                except Exception as e:
+                    logger.warning("Full sync upload from archive failed for %s: %s", filename, e)
+                continue
+
+            # Not in archive → pull from frame (using correct remote path)
+            local_path = dirs["processed"] / filename
+            if pusher.pull_file(filename, local_path, remote_path=frame_by_name[filename]):
+                try:
+                    gp_sync.upload_file(local_path)
+                except Exception as e:
+                    logger.warning("Full sync GP upload failed for %s: %s", filename, e)
+                    local_path.unlink(missing_ok=True)
+                else:
+                    try:
+                        shutil.move(str(local_path), str(dirs["archive"] / filename))
+                    except OSError as e:
+                        logger.warning("Full sync move to archive failed for %s: %s", filename, e)
+                        local_path.unlink(missing_ok=True)
+            else:
+                logger.warning("Full sync: could not pull %s from frame", filename)
+
+    # 4. Files in album but NOT on frame → remove from album
+    #    Skip if any path scan failed — we might have an incomplete view
+    #    and would wrongly remove photos that are still on the frame.
+    if any_path_failed:
+        logger.warning("Full sync: skipping album removal (incomplete frame scan)")
+        logger.info("Daily Google Photos full sync complete (partial)")
+        return
+    missing_from_frame = uploaded_set - frame_set
+    if missing_from_frame:
+        logger.info(
+            "Full sync: %d file(s) in album but not on frame, removing",
+            len(missing_from_frame),
+        )
+        filenames_to_remove = sorted(missing_from_frame)
+        media_ids = [uploaded[f] for f in filenames_to_remove]
+        # batchRemoveMediaItems supports max 50 per call
+        for i in range(0, len(media_ids), 50):
+            batch_ids = media_ids[i : i + 50]
+            batch_names = filenames_to_remove[i : i + 50]
+            try:
+                if gp_sync.remove_from_album(batch_ids):
+                    for fname in batch_names:
+                        gp_sync.mark_removed(fname)
+            except Exception as e:
+                logger.warning("Full sync remove-from-album failed: %s", e)
+
+    logger.info("Daily Google Photos full sync complete")
+
+
+def _cleanup_old_archives(
+    gp_sync: GooglePhotosSync,
+    archive_dir: Path,
+    retention_days: int,
+) -> None:
+    """Delete archived files older than retention_days that are confirmed in GP."""
+    uploaded = gp_sync.get_uploaded_files()
+    if not uploaded:
+        return
+
+    now = time.time()
+    cutoff = now - (retention_days * 86400)
+    deleted = 0
+
+    for f in sorted(archive_dir.iterdir()):
+        if not f.is_file():
+            continue
+        if f.name not in uploaded:
+            continue
+        if f.stat().st_mtime > cutoff:
+            continue
+        f.unlink()
+        deleted += 1
+
+    if deleted:
+        logger.info("Archive cleanup: deleted %d file(s) older than %d days", deleted, retention_days)
 
 
 def load_config(config_path: str) -> dict:

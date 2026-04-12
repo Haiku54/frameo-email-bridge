@@ -89,6 +89,39 @@ def main() -> None:
             print("  Install with: sudo apt install ffmpeg")
     print()
 
+    # Google Photos section (optional)
+    print("--- Google Photos Backup (Optional) ---")
+    print("Sync pushed photos to a shared Google Photos album for family viewing.")
+    print("Requires a Google Cloud project with the Photos Library API enabled.")
+    print()
+    if "google_photos" not in config:
+        config["google_photos"] = {}
+    gp_enabled = _prompt_yesno(
+        "Enable Google Photos sync",
+        default=config["google_photos"].get("enabled", False),
+    )
+    config["google_photos"]["enabled"] = gp_enabled
+    if gp_enabled:
+        config["google_photos"]["credentials_file"] = _prompt(
+            "Path to credentials.json",
+            default=config["google_photos"].get("credentials_file", "credentials.json"),
+        )
+        config["google_photos"]["album_name"] = _prompt(
+            "Album name",
+            default=config["google_photos"].get("album_name", "Frameo Photos"),
+        )
+        config["google_photos"]["full_sync_time"] = _prompt(
+            "Daily full sync time (24h format, e.g. 03:00)",
+            default=config["google_photos"].get("full_sync_time", "03:00"),
+        )
+        creds_path = Path(__file__).parent / config["google_photos"]["credentials_file"]
+        if not creds_path.exists():
+            print()
+            print(f"  NOTE: {creds_path.name} not found yet.")
+            print("  Download it from Google Cloud Console before starting the service.")
+            print("  Then run: .venv/bin/python google_photos.py --auth")
+    print()
+
     # Frame discovery section
     print("--- Frame Discovery ---")
     frame_info = _discover_frame()

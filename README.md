@@ -18,6 +18,7 @@ Email (photo/video) → Gmail → Poll IMAP → Subject filter → Download
 - **Videos**: MP4, MOV, M4V, AVI, MKV, WEBM, 3GP — trimmed to configurable max duration, re-encoded for frame compatibility
 - **Subject filter**: only process emails with a specific subject line (e.g. "Frameo")
 - **Sender whitelist**: restrict to specific email addresses
+- **Google Photos sync**: automatically uploads pushed photos to a shared Google Photos album so family can view them (optional)
 - **Auto-discovery**: finds your frame on the network via port scan (after first USB setup)
 - **Self-healing IP**: if the frame's IP changes (DHCP lease renewal, router reboot, Android MAC randomization), the service automatically rediscovers it on the next push attempt and updates `config.yaml` — no manual intervention needed
 - **Interactive setup**: one command, answers questions, configures everything
@@ -81,6 +82,7 @@ It will read your existing `config.yaml` and let you accept each current value b
 - **Gmail account with App Password** (regular passwords won't work)
 - **Frameo frame** on the same WiFi network as the service host
 - **USB cable** for the one-time initial setup
+- **Google account** (optional, only needed for Google Photos sync)
 
 ### Installing system dependencies
 
@@ -264,6 +266,60 @@ Supported input formats: `.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`, `.webm`, `.3gp`
 
 ---
 
+## Google Photos Sync (Optional)
+
+Automatically syncs photos on the frame to a shared Google Photos album. Family members can open the album link to see what's on the frame — no app install needed.
+
+**How it works:**
+- When a photo arrives via email and is pushed to the frame, it's **immediately uploaded** to the album
+- Once per day (configurable), a **full sync** compares the frame with the album: uploads new files, removes deleted ones
+- The full sync also picks up photos sent via the **Frameo phone app** (not just email)
+- Old archived files are automatically cleaned up after a configurable number of days
+
+### Setup
+
+**Step 1 — Google Cloud Console:**
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com)
+2. Create a new project (e.g. "Frameo Photos")
+3. In the API Library, search and enable **"Photos Library API"**
+4. Go to **APIs & Services → Credentials**
+5. Click **Create Credentials → OAuth client ID**
+6. Application type: **Desktop app**
+7. Download the JSON → rename to `credentials.json` → place in the project directory
+8. Go to **OAuth consent screen** → add your Google account as a **test user**
+9. Click **"Publish App"** on the OAuth consent screen — this prevents tokens from expiring after 7 days (no Google review needed for personal use)
+
+**Step 2 — Authorize (one-time):**
+
+```bash
+.venv/bin/python google_photos.py --auth
+```
+
+This opens a browser for Google authorization. On headless systems (Raspberry Pi), use `--headless` to get a URL you can open from another device.
+
+**Step 3 — Enable in config:**
+
+Add to `config.yaml`:
+```yaml
+google_photos:
+  enabled: true
+  credentials_file: "credentials.json"
+  album_name: "Frameo Photos"
+  full_sync_time: "03:00"
+  archive_retention_days: 7
+```
+
+**Step 4 — Share the album:**
+
+Open Google Photos → Albums → "Frameo Photos" → Share. Send the link to family.
+
+### Moving to Raspberry Pi
+
+The OAuth token is portable. Copy the entire project directory **including `data/token.json`** to the Pi. The token refreshes automatically — no need to re-authorize.
+
+---
+
 ## Running the Service
 
 There are 3 ways to run the service. Pick the one that fits your needs.
@@ -367,7 +423,8 @@ The compose file bind-mounts every runtime directory to the host so nothing is l
 - `./inbox/`, `./processed/` — in-flight attachments (retry queue)
 - `./archive/` — successfully pushed files
 - `./logs/` — rotating log files
-- `./data/` — SQLite DB of processed email UIDs
+- `./data/` — SQLite DB of processed email UIDs + Google Photos OAuth token
+- `./credentials.json` (read-only, only if Google Photos sync is enabled)
 
 > `network_mode: host` is required in `docker-compose.yml` so the container can reach the Frameo frame's ADB port on your LAN.
 
@@ -397,6 +454,11 @@ All settings live in `config.yaml`. See `config.yaml.example` for the full templ
 | `processing.accept_videos` | `true` | Process video attachments |
 | `processing.max_video_duration_seconds` | `10` | Trim videos longer than this |
 | `processing.video_max_file_size_mb` | `20` | Max output video size |
+| `google_photos.enabled` | `false` | Enable Google Photos sync |
+| `google_photos.credentials_file` | `credentials.json` | OAuth2 credentials from Google Cloud Console |
+| `google_photos.album_name` | `Frameo Photos` | Album name (created automatically) |
+| `google_photos.full_sync_time` | `03:00` | Daily full sync time (24h format) |
+| `google_photos.archive_retention_days` | `7` | Delete archived files after N days (0 = keep forever) |
 
 ---
 
@@ -416,6 +478,9 @@ All settings live in `config.yaml`. See `config.yaml.example` for the full templ
 | `ffmpeg not found` | Install with `sudo apt install ffmpeg`, or set `accept_videos: false` |
 | HEIC files not converted | `pillow-heif` should be installed automatically. Re-run `setup.sh` |
 | Service crashes on Raspberry Pi | Check `logs/frameo_bridge.log`. Ensure stable WiFi connection |
+| Google Photos auth failed | Check that `credentials.json` exists. Re-run `.venv/bin/python google_photos.py --auth` |
+| Google Photos token expired | Click "Publish App" in Google Cloud Console OAuth consent screen, then re-run `--auth` |
+| Photos not appearing in album | Check `google_photos.enabled: true` in config.yaml. Check `logs/frameo_bridge.log` for errors |
 
 ---
 
@@ -428,7 +493,8 @@ frameo-email-bridge/
 ├── email_monitor.py         # Gmail IMAP polling + subject filter
 ├── image_processor.py       # Photo resize/convert/optimize
 ├── video_processor.py       # Video trim/resize/re-encode (ffmpeg)
-├── frame_pusher.py          # ADB push to frame
+├── frame_pusher.py          # ADB push to frame + list/pull for sync
+├── google_photos.py         # Google Photos album sync + OAuth2 auth
 ├── discover_frame.py        # Network scan for Frameo frames
 ├── adb_setup.py             # Low-level USB→WiFi ADB setup helpers
 ├── setup.sh                 # Bootstrap script (venv + deps + configure)
@@ -438,9 +504,11 @@ frameo-email-bridge/
 ├── docker-compose.yml       # Docker Compose config
 ├── docker-entrypoint.sh     # Validates config.yaml before starting the container
 ├── LICENSE                  # MIT
+├── credentials.json         # Google OAuth2 credentials (not committed)
 ├── inbox/                   # Downloaded attachments (transient)
 ├── processed/               # Processed files awaiting push (transient)
 ├── archive/                 # Successfully pushed files
+├── data/                    # SQLite DB + Google Photos OAuth token
 └── logs/                    # Log files
 ```
 

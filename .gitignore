@@ -11,6 +11,8 @@ ENV/
 
 # Config with credentials
 config.yaml
+credentials.json
+data/token.json
 
 # Runtime directories (contain user photos, videos, logs — may be sensitive)
 inbox/
