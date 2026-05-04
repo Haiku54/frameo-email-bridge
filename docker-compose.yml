@@ -8,11 +8,17 @@ services:
     network_mode: host
     volumes:
       # IMPORTANT: config.yaml must exist on the host BEFORE running
-      # `docker compose up`. Generate it by running `bash setup.sh` once
-      # (or copy config.yaml.example -> config.yaml and edit it manually).
+      # `docker compose up`. Generate it by running `bash setup.sh` once,
+      # or run the wizard inside the container:
+      #   docker compose run --rm frameo-bridge python configure.py
       # If the file does not exist, Docker will create an empty directory
       # at this path and the container will fail to start.
-      - ./config.yaml:/app/config.yaml:ro
+      #
+      # NOTE: mounted read-write because frame_pusher.py rewrites
+      # config.yaml when it self-heals after the frame's IP changes
+      # (auto-rediscovery). Do NOT add :ro here — it will silently break
+      # IP rediscovery the next time the frame moves.
+      - ./config.yaml:/app/config.yaml
       # Runtime directories — all persisted to the host so nothing is lost
       # on container restart.
       - ./inbox:/app/inbox

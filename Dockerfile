@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 # System dependencies:
 #   adb    — push photos/videos to the Frameo frame via WiFi

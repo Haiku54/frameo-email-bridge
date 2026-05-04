@@ -1,0 +1,55 @@
+# Reduce the build context sent to the Docker daemon.
+# (The Dockerfile COPYs specific files, so this mainly speeds up
+#  "Sending build context to daemon" — important on slow SD-card hosts
+#  like a Raspberry Pi.)
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets & host-specific config (never bake into images)
+config.yaml
+credentials.json
+data/
+
+# Runtime directories (potentially large, host-only)
+inbox/
+processed/
+archive/
+logs/
+
+# Docker empty-directory artifact (see .gitignore)
+/config.yaml/
+
+# Logs
+*.log
+
+# Git / docs / IDE
+.git/
+.gitignore
+.github/
+README.md
+CLAUDE.md
+LICENSE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test artifacts
+Screenshot*.png
+test_*.jpg
+test_*.mp4
+*.bak
