@@ -306,7 +306,7 @@ def _retry_gp_uploads(gp_sync: GooglePhotosSync, archive_dir: Path) -> None:
             continue
         if f.name.startswith("_configure_test"):
             continue
-        # Skip files that were removed from the album (deleted from frame)
+        # Skip files that were intentionally removed (deleted from frame)
         if gp_sync.is_removed(f.name):
             continue
         if not gp_sync.upload_file(f):
@@ -396,33 +396,19 @@ def _run_full_sync(
             else:
                 logger.warning("Full sync: could not pull %s from frame", filename)
 
-    # 4. Files in album but NOT on frame → remove from album
-    #    Skip if any path scan failed — we might have an incomplete view
-    #    and would wrongly remove photos that are still on the frame.
-    if any_path_failed:
-        logger.warning("Full sync: skipping album removal (incomplete frame scan)")
-        logger.info("Daily Google Photos full sync complete (partial)")
-        return
-    missing_from_frame = uploaded_set - frame_set
-    if missing_from_frame:
-        logger.info(
-            "Full sync: %d file(s) in album but not on frame, removing",
-            len(missing_from_frame),
-        )
-        filenames_to_remove = sorted(missing_from_frame)
-        media_ids = [uploaded[f] for f in filenames_to_remove]
-        # batchRemoveMediaItems supports max 50 per call
-        for i in range(0, len(media_ids), 50):
-            batch_ids = media_ids[i : i + 50]
-            batch_names = filenames_to_remove[i : i + 50]
-            try:
-                if gp_sync.remove_from_album(batch_ids):
-                    for fname in batch_names:
-                        gp_sync.mark_removed(fname)
-            except Exception as e:
-                logger.warning("Full sync remove-from-album failed: %s", e)
+    # NOTE: We intentionally do NOT remove files from the Google Photos
+    # album when they disappear from the frame.  The Frameo app renames
+    # and reorganises files on-device (e.g. adding/removing a "_sync_"
+    # prefix, moving between DCIM and frameo_files/media/).  Because the
+    # sync identifies photos by filename, a rename looks like a deletion
+    # + a new file, causing the old copy to be incorrectly removed from
+    # the album.  Keeping the album additive-only avoids this class of
+    # bugs entirely.
 
-    logger.info("Daily Google Photos full sync complete")
+    if any_path_failed:
+        logger.info("Daily Google Photos full sync complete (partial — some paths failed)")
+    else:
+        logger.info("Daily Google Photos full sync complete")
 
 
 def _cleanup_old_archives(
