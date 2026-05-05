@@ -18,13 +18,21 @@ from pathlib import Path
 import yaml
 
 from email_monitor import EmailMonitor
+from email_replier import EmailReplier, FailureReason
 from frame_pusher import FramePusher
 from google_photos import GooglePhotosSync
-from image_processor import ImageProcessingError, HeicNotSupportedError, process_image
+from image_processor import (
+    HeicNotSupportedError,
+    ImageProcessingError,
+    ImageTooSmallError,
+    process_image,
+)
 from video_processor import (
     VIDEO_EXTENSIONS,
     FfmpegNotInstalledError,
     VideoProcessingError,
+    VideoTimeoutError,
+    VideoTooLongError,
     process_video,
 )
 
@@ -74,6 +82,20 @@ def main():
             logger.warning("Google Photos auth failed — sync disabled")
             gp_sync = None
 
+    # Initialize the Hebrew reply summariser (optional, opt-in).
+    # Failures here only disable replies — the main pipeline continues.
+    replier: EmailReplier | None = None
+    if config.get("email", {}).get("reply_with_summary", False):
+        try:
+            replier = EmailReplier(config, monitor)
+            logger.info(
+                "Reply summary enabled — will send Hebrew replies via SMTP %s:%d",
+                replier.host, replier.port,
+            )
+        except Exception as e:
+            logger.warning("Reply summary init failed — replies disabled: %s", e)
+            replier = None
+
     # Health check
     if pusher.health_check():
         logger.info("Frame health check passed")
@@ -112,7 +134,7 @@ def main():
         while running:
             try:
                 count = run_pipeline(
-                    monitor, pusher, dirs, processing_config, gp_sync,
+                    monitor, pusher, dirs, processing_config, gp_sync, replier,
                 )
                 if count > 0:
                     logger.info("Cycle complete: %d photo(s) pushed", count)
@@ -168,25 +190,44 @@ def _process_one_file(
     pusher: FramePusher,
     dirs: dict,
     processing_config: dict,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, FailureReason | None, dict | None]:
     """Process and push a single file from inbox/.
 
-    Returns (pushed, output_name). output_name is the name of the file that
-    was produced in processed/ (None if processing failed).
+    Returns ``(pushed, output_name, reason, detail)``.
+
+    - ``output_name`` is the name produced in ``processed/`` (None if
+      processing failed and no file made it that far).
+    - ``reason`` is None when ``pushed`` is True. Otherwise it is the
+      typed ``FailureReason`` mapping the underlying exception (or
+      ``FRAME_DISCONNECTED`` if processing succeeded but the push
+      itself failed). The reply-summary feature uses this to render
+      family-readable Hebrew explanations.
+    - ``detail`` carries optional context (e.g. ``{"duration": 35,
+      "limit": 10}``) interpolated into the Hebrew message.
     """
     if is_video:
         output_name = f"{output_stem}.mp4"
         output_path = dirs["processed"] / output_name
         try:
             process_video(input_path, output_path, processing_config)
+        except VideoTooLongError as e:
+            logger.warning("%s — moving to failed/", e)
+            _move_to_failed(input_path, dirs["failed"])
+            return False, None, FailureReason.VIDEO_TOO_LONG, {
+                "duration": e.duration_seconds, "limit": e.limit_seconds,
+            }
         except FfmpegNotInstalledError as e:
             logger.error("%s — moving to failed/", e)
             _move_to_failed(input_path, dirs["failed"])
-            return False, None
+            return False, None, FailureReason.VIDEO_FFMPEG_MISSING, None
+        except VideoTimeoutError as e:
+            logger.error("Video processing timeout for %s: %s", input_path.name, e)
+            _move_to_failed(input_path, dirs["failed"])
+            return False, None, FailureReason.VIDEO_TIMEOUT, None
         except VideoProcessingError as e:
             logger.error("Video processing failed for %s: %s", input_path.name, e)
             _move_to_failed(input_path, dirs["failed"])
-            return False, None
+            return False, None, FailureReason.VIDEO_ENCODE_FAILED, None
     else:
         output_name = f"{output_stem}.jpg"
         output_path = dirs["processed"] / output_name
@@ -195,11 +236,17 @@ def _process_one_file(
         except HeicNotSupportedError as e:
             logger.warning("%s — moving to failed/", e)
             _move_to_failed(input_path, dirs["failed"])
-            return False, None
+            return False, None, FailureReason.HEIC_UNSUPPORTED, None
+        except ImageTooSmallError as e:
+            logger.warning("%s — moving to failed/", e)
+            _move_to_failed(input_path, dirs["failed"])
+            return False, None, FailureReason.IMAGE_TOO_SMALL, {
+                "width": e.width, "height": e.height,
+            }
         except ImageProcessingError as e:
             logger.error("Image processing failed for %s: %s", input_path.name, e)
             _move_to_failed(input_path, dirs["failed"])
-            return False, None
+            return False, None, FailureReason.IMAGE_BAD_FORMAT, None
 
     # Remove original from inbox
     try:
@@ -208,7 +255,13 @@ def _process_one_file(
         pass
 
     pushed = pusher.push_photo(output_path)
-    return pushed, output_name
+    if pushed:
+        return True, output_name, None, None
+    # Push failed but processing succeeded — file is sitting in processed/
+    # waiting for the next cycle's leftover-retry loop. Treat as transient
+    # so the reply summary is deferred (we don't want to tell the family
+    # "your photo didn't make it" when it'll go up in 60 seconds).
+    return False, output_name, FailureReason.FRAME_DISCONNECTED, None
 
 
 def _process_inbox_orphans(
@@ -229,7 +282,7 @@ def _process_inbox_orphans(
         logger.warning("Recovering orphaned file from prior crash: %s", orphan.name)
         is_video = orphan.suffix.lower() in VIDEO_EXTENSIONS
         stem = orphan.stem
-        pushed, _ = _process_one_file(
+        pushed, _output, _reason, _detail = _process_one_file(
             orphan, stem, is_video, pusher, dirs, processing_config
         )
         if pushed:
@@ -243,6 +296,7 @@ def run_pipeline(
     dirs: dict,
     processing_config: dict,
     gp_sync: GooglePhotosSync | None = None,
+    replier: EmailReplier | None = None,
 ) -> int:
     """Run one polling cycle: email -> download -> process -> push."""
     attachments = monitor.check_for_new_photos()
@@ -251,11 +305,35 @@ def run_pipeline(
 
     for att in attachments:
         stem = f"{att.uid}_{Path(att.original_filename).stem}"
-        was_pushed, output_name = _process_one_file(
+        # Record initial pending state so the reply phase knows this email
+        # has at least one item even if processing crashes.
+        if replier:
+            monitor.record_outcome(
+                att.uid, att.original_filename, att.is_video, "pending",
+            )
+        was_pushed, output_name, reason, detail = _process_one_file(
             att.file_path, stem, att.is_video, pusher, dirs, processing_config
         )
         if output_name:
             current_outputs.add(output_name)
+        if replier:
+            if was_pushed:
+                monitor.record_outcome(
+                    att.uid, att.original_filename, att.is_video, "pushed",
+                    output_filename=output_name,
+                )
+            elif reason in (FailureReason.FRAME_DISCONNECTED,):
+                # Transient — leave as 'pending' so the reply is deferred
+                # to a later cycle when the leftover retry loop succeeds.
+                monitor.record_outcome(
+                    att.uid, att.original_filename, att.is_video, "pending",
+                    output_filename=output_name,
+                )
+            else:
+                monitor.record_outcome(
+                    att.uid, att.original_filename, att.is_video, "failed",
+                    reason=reason, detail=detail,
+                )
         if was_pushed:
             pushed += 1
             # Immediate upload to Google Photos
@@ -273,6 +351,8 @@ def run_pipeline(
         logger.info("Retrying previously failed push: %s", leftover.name)
         if pusher.push_photo(leftover):
             pushed += 1
+            if replier:
+                _record_leftover_pushed(monitor, leftover.name)
             if gp_sync:
                 _gp_upload_safe(gp_sync, pusher.archive_dir / leftover.name)
 
@@ -280,7 +360,44 @@ def run_pipeline(
     if gp_sync:
         _retry_gp_uploads(gp_sync, dirs["archive"])
 
+    # Resolve-and-reply: send a Hebrew summary for any email whose
+    # attachments have all reached a terminal state. This wraps the loop
+    # in a try/except (defense-in-depth) — send_summary_safe never raises,
+    # but we don't trust the iteration itself to fail us.
+    if replier:
+        try:
+            for uid in monitor.pending_resolution_uids():
+                if monitor.pending_count(uid) > 0:
+                    continue  # not fully resolved, skip this cycle
+                outcome = monitor.get_email_outcome(uid)
+                if outcome is None:
+                    continue
+                replier.send_summary_safe(outcome)
+        except Exception as e:
+            logger.warning("Reply-resolution loop failed: %s", e)
+
     return pushed
+
+
+def _record_leftover_pushed(monitor: EmailMonitor, output_filename: str) -> None:
+    """Mark a successfully-pushed leftover file as 'pushed' in the outcomes table.
+
+    Parses the UID from the leading ``{uid}_`` of the filename, then looks
+    up the matching pending row by output_filename. Best-effort — unmatched
+    leftovers (e.g. files predating this feature) are simply skipped.
+    """
+    try:
+        uid = output_filename.split("_", 1)[0]
+    except IndexError:
+        return
+    found = monitor.lookup_pending_by_output(uid, output_filename)
+    if found is None:
+        return
+    original_filename, is_video = found
+    monitor.record_outcome(
+        uid, original_filename, is_video, "pushed",
+        output_filename=output_filename,
+    )
 
 
 def _gp_upload_safe(gp_sync: GooglePhotosSync, archive_path: Path) -> None:

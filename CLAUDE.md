@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Frameo Email Bridge is a Python service that monitors a Gmail inbox via IMAP and automatically pushes photo/video attachments to a Frameo digital photo frame over WiFi using ADB. Optionally syncs all frame photos to a shared Google Photos album for family viewing. The pipeline: Email → Gmail IMAP poll → filter by subject/sender → download → resize/convert/optimize → `adb push` to frame → appears on frame (→ upload to Google Photos album).
+Frameo Email Bridge is a Python service that monitors a Gmail inbox via IMAP and automatically pushes photo/video attachments to a Frameo digital photo frame over WiFi using ADB. Optionally syncs all frame photos to a shared Google Photos album for family viewing, and can send a friendly Hebrew reply summary back to the sender after each email is processed. The pipeline: Email → Gmail IMAP poll → filter by subject/sender → download → resize/convert/optimize → `adb push` to frame → appears on frame (→ upload to Google Photos album → reply with Hebrew summary).
 
 ## Commands
 
@@ -32,16 +32,17 @@ There are no tests, linting, or build steps. The project uses a `.venv/` virtual
 
 ## Architecture
 
-Nine Python modules:
+Ten Python modules:
 
 ```
-main.py (orchestrator, polling loop, GP sync scheduling)
-  ├── email_monitor.py    IMAP client, downloads attachments to inbox/
+main.py (orchestrator, polling loop, GP sync scheduling, reply resolution)
+  ├── email_monitor.py    IMAP client, downloads attachments to inbox/, tracks per-attachment outcomes
   ├── image_processor.py  PIL: resize, rotate, sharpen, optimize → processed/
-  ├── video_processor.py  ffmpeg subprocess: trim, scale, re-encode → processed/
+  ├── video_processor.py  ffmpeg subprocess: scale, re-encode → processed/ (rejects too-long videos)
   ├── frame_pusher.py     ADB subprocess: push to frame, archive on success
   │     └── discover_frame.py  Network subnet scan for Frameo frames
-  └── google_photos.py    OAuth2 auth, two-step upload, album management, SQLite tracking
+  ├── google_photos.py    OAuth2 auth, two-step upload, album management, SQLite tracking
+  └── email_replier.py    SMTP, Hebrew templates, threading; sends per-email summary replies
 
 configure.py   Interactive config wizard (standalone entry point)
 adb_setup.py   USB→WiFi ADB one-time setup helpers (used by configure.py)
@@ -50,13 +51,14 @@ adb_setup.py   USB→WiFi ADB one-time setup helpers (used by configure.py)
 ### Polling Cycle (main.py → run_pipeline)
 
 1. `EmailMonitor.check_for_new_photos()` — IMAP SINCE search, filter against SQLite DB of processed UIDs, download to `inbox/`
-2. For each attachment: determine image vs video, process via `image_processor` or `video_processor`, output to `processed/`
-3. `FramePusher.push_photo()` — ADB push to frame, trigger media scan, move to `archive/`
+2. For each attachment: record `pending` outcome row, then process via `image_processor` or `video_processor` → `processed/`
+3. `FramePusher.push_photo()` — ADB push to frame, trigger media scan, move to `archive/`. Outcome row updated to `pushed` / `pending` (transient push fail) / `failed` (terminal processing fail).
 4. If Google Photos enabled: immediately upload archived file to album via `GooglePhotosSync.upload_file()`
-5. Retry any files left in `processed/` from prior failed pushes
+5. Retry any files left in `processed/` from prior failed pushes; on success, update the matching outcome row by `output_filename`.
 6. Retry any Google Photos uploads that previously failed (scan `archive/` against SQLite)
-7. If daily full sync time reached: `_run_full_sync()` — compare frame contents (DCIM + frameo_files/media/) with album, upload missing, remove deleted, clean up old archives
-8. Sleep `poll_interval_seconds` (in 1-second increments for responsive shutdown)
+7. **Resolve-and-reply phase**: if reply summaries are enabled, iterate UIDs with `reply_sent=0` and no `pending` rows; send a Hebrew summary via `EmailReplier.send_summary_safe`, mark `reply_sent=1`. UIDs with any pending rows are deferred to a later cycle.
+8. If daily full sync time reached: `_run_full_sync()` — compare frame contents (DCIM + frameo_files/media/) with album, upload missing, clean up old archives. (Album removal is intentionally disabled — see commit `6f4d5a3`.)
+9. Sleep `poll_interval_seconds` (in 1-second increments for responsive shutdown)
 
 ### Key Design Decisions
 
@@ -67,6 +69,10 @@ adb_setup.py   USB→WiFi ADB one-time setup helpers (used by configure.py)
 - **Atomic writes**: Video processing writes to a temp file (mkstemp), only moves to output on success. Files are archived only after a successful `adb push`.
 - **Graceful shutdown**: SIGTERM/SIGINT set `running=False`; main loop exits cleanly; SQLite connections closed in `finally` block.
 - **Google Photos isolation**: GP upload failures never block the email→frame pipeline. All GP calls wrapped in try/except. Failed uploads retried next cycle.
+- **Reply summary isolation**: SMTP failures never block the pipeline either. `EmailReplier.send_summary_safe` catches every exception and logs a WARNING; the `reply_sent` flag stays `0` so a transient SMTP outage doesn't auto-resend later.
+- **Deferred replies for transient failures**: if any attachment is in `pending` state (typically `FRAME_DISCONNECTED`), the reply for that email is held until the next cycle resolves it. This avoids telling the family "your video didn't make it" when the leftover-retry loop pushes it 60 seconds later.
+- **Typed processing exceptions**: `image_processor` and `video_processor` raise typed subclasses (`HeicNotSupportedError`, `ImageTooSmallError`, `VideoTooLongError(duration, limit)`, `VideoTimeoutError`, `FfmpegNotInstalledError`) so `_process_one_file` in `main.py` can map each one to a specific `FailureReason` enum without parsing log strings. This is the single error→reason mapping point.
+- **Video too-long is now a rejection**: prior versions silently trimmed any video longer than `max_video_duration_seconds` to that length. The bridge now rejects too-long videos so the sender's reply summary can explain why.
 - **Google Photos two-step upload**: Raw bytes POST to `/v1/uploads` returns upload token, then `mediaItems:batchCreate` with token + album ID. Uses `AuthorizedSession` from google-auth.
 - **Full sync dual-path**: Scans both `/sdcard/DCIM/` (service-pushed) and `/sdcard/frameo_files/media/` (Frameo app). Skips album removal if any path scan fails (prevents data loss on partial ADB failure).
 - **Archive cleanup**: After confirmed GP upload, files older than `archive_retention_days` are deleted. Only files tracked in SQLite are eligible.
@@ -79,13 +85,13 @@ adb_setup.py   USB→WiFi ADB one-time setup helpers (used by configure.py)
 - `archive/` — successfully pushed files
 - `archive/failed/` — files that failed processing (bad format, etc.)
 - `logs/` — `frameo_bridge.log` (RotatingFileHandler, 5MB, 3 backups)
-- `data/` — `processed_emails.db` (SQLite: email UIDs + GP upload tracking + GP removed tracking), `token.json` (Google OAuth2 refresh token)
+- `data/` — `processed_emails.db` (SQLite: email UIDs + per-attachment outcomes + reply-sent flag + GP upload tracking + GP removed tracking), `token.json` (Google OAuth2 refresh token)
 
 ## Configuration
 
 All settings in `config.yaml` (not committed — contains Gmail credentials). See `config.yaml.example` for the template with all fields and comments.
 
-Four sections: `email` (IMAP server, credentials, poll interval, subject/sender filters), `frame` (ADB IP/port, photo path, resolution, push timeout), `processing` (image quality/size limits, video duration/size limits, HEIC conversion toggle), `google_photos` (enabled, credentials file, album name, daily sync time, archive retention days).
+Four sections: `email` (IMAP server, credentials, poll interval, subject/sender filters, optional SMTP reply-summary settings: `reply_with_summary`/`smtp_server`/`smtp_port`/`smtp_from_name`), `frame` (ADB IP/port, photo path, resolution, push timeout), `processing` (image quality/size limits, video duration/size limits, HEIC conversion toggle), `google_photos` (enabled, credentials file, album name, daily sync time, archive retention days).
 
 ## Conventions
 

@@ -25,6 +25,15 @@ class HeicNotSupportedError(ImageProcessingError):
     pass
 
 
+class ImageTooSmallError(ImageProcessingError):
+    """Image dimensions are below MIN_DIMENSION on at least one axis."""
+
+    def __init__(self, width: int, height: int):
+        super().__init__(f"Image too small ({width}x{height}), skipping")
+        self.width = width
+        self.height = height
+
+
 def process_image(input_path: Path, output_path: Path, config: dict) -> Path:
     """Process a single image: convert, rotate, resize, strip metadata, optimize size.
 
@@ -49,9 +58,7 @@ def process_image(input_path: Path, output_path: Path, config: dict) -> Path:
 
     # Skip tiny images
     if img.width < MIN_DIMENSION or img.height < MIN_DIMENSION:
-        raise ImageProcessingError(
-            f"Image too small ({img.width}x{img.height}), skipping"
-        )
+        raise ImageTooSmallError(img.width, img.height)
 
     # For animated images, use first frame
     if hasattr(img, "n_frames") and img.n_frames > 1:

@@ -8,11 +8,16 @@ import dataclasses
 import email
 import email.policy
 import imaplib
+import json
 import logging
 import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from email_replier import EmailOutcome, FailureReason
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +33,13 @@ SAFE_FILENAME_RE = re.compile(r"[^\w\-.]")
 class DownloadedAttachment:
     file_path: Path
     original_filename: str
-    sender: str
+    sender: str                  # bare addr, lowercase
     uid: str
     download_time: datetime
     is_video: bool = False
+    sender_display: str = ""     # original "Name <addr>" From header
+    subject: str = ""
+    message_id: str | None = None
 
 
 class EmailMonitor:
@@ -90,6 +98,54 @@ class EmailMonitor:
                 value TEXT
             )
         """)
+
+        # Idempotent migration: add columns the reply-summary feature needs
+        # without touching existing installs' data. Older databases just
+        # gain the new columns with NULL/0 defaults.
+        existing_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(processed_emails)").fetchall()
+        }
+        if "message_id" not in existing_cols:
+            conn.execute("ALTER TABLE processed_emails ADD COLUMN message_id TEXT")
+        if "sender_display" not in existing_cols:
+            conn.execute("ALTER TABLE processed_emails ADD COLUMN sender_display TEXT")
+        if "reply_sent" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE processed_emails ADD COLUMN reply_sent INTEGER DEFAULT 0"
+            )
+
+        # Per-attachment outcome state — used by the reply-summary feature
+        # to decide when an email is fully resolved (no items still pending).
+        # output_filename is the name in processed/ once processing succeeds
+        # ({uid}_{stem}.{ext}); used to map a leftover retry back to its row.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attachment_outcomes (
+                uid TEXT NOT NULL,
+                original_filename TEXT NOT NULL,
+                is_video INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                reason TEXT,
+                detail_json TEXT,
+                output_filename TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (uid, original_filename)
+            )
+        """)
+        # Idempotent column add for existing dbs (created before this commit).
+        outcome_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(attachment_outcomes)").fetchall()
+        }
+        if "output_filename" not in outcome_cols:
+            conn.execute("ALTER TABLE attachment_outcomes ADD COLUMN output_filename TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outcomes_state ON attachment_outcomes(state)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outcomes_output ON attachment_outcomes(output_filename)"
+        )
+
         conn.commit()
         return conn
 
@@ -234,13 +290,14 @@ class EmailMonitor:
 
         sender = msg.get("From", "")
         subject = msg.get("Subject", "")
+        message_id = msg.get("Message-ID")
 
         # Extract just the email address from "Name <email>" format
         sender_addr = email.utils.parseaddr(sender)[1].lower()
 
         if not self._is_sender_allowed(sender_addr):
             logger.info("Sender %s not in whitelist, skipping", sender_addr)
-            self._mark_uid_processed(uid, sender_addr, subject, 0)
+            self._mark_uid_processed(uid, sender_addr, subject, 0, sender, message_id)
             return []
 
         if not self._matches_subject_filter(subject):
@@ -248,13 +305,18 @@ class EmailMonitor:
                 "Subject %r does not match filter %r, skipping",
                 subject, self.subject_filter,
             )
-            self._mark_uid_processed(uid, sender_addr, subject, 0)
+            self._mark_uid_processed(uid, sender_addr, subject, 0, sender, message_id)
             return []
 
-        attachments = self._extract_attachments(msg, uid, sender_addr)
+        attachments = self._extract_attachments(
+            msg, uid, sender_addr,
+            sender_display=sender, subject=subject, message_id=message_id,
+        )
 
         # Record UID in our DB — this is the only dedup mechanism now.
-        self._mark_uid_processed(uid, sender_addr, subject, len(attachments))
+        self._mark_uid_processed(
+            uid, sender_addr, subject, len(attachments), sender, message_id,
+        )
 
         if attachments:
             logger.info(
@@ -265,7 +327,13 @@ class EmailMonitor:
         return attachments
 
     def _extract_attachments(
-        self, msg: email.message.Message, uid: str, sender: str
+        self,
+        msg: email.message.Message,
+        uid: str,
+        sender: str,
+        sender_display: str = "",
+        subject: str = "",
+        message_id: str | None = None,
     ) -> list[DownloadedAttachment]:
         attachments = []
 
@@ -346,6 +414,9 @@ class EmailMonitor:
                 uid=uid,
                 download_time=datetime.now(),
                 is_video=is_video,
+                sender_display=sender_display,
+                subject=subject,
+                message_id=message_id,
             ))
             kind = "video" if is_video else "image"
             logger.debug("Saved %s: %s (%d KB)", kind, save_path.name, len(payload) // 1024)
@@ -370,10 +441,168 @@ class EmailMonitor:
         return row is not None
 
     def _mark_uid_processed(
-        self, uid: str, sender: str, subject: str, attachment_count: int
+        self,
+        uid: str,
+        sender: str,
+        subject: str,
+        attachment_count: int,
+        sender_display: str = "",
+        message_id: str | None = None,
     ) -> None:
         self.db.execute(
-            "INSERT OR IGNORE INTO processed_emails (uid, sender, subject, attachment_count) VALUES (?, ?, ?, ?)",
-            (uid, sender, subject, attachment_count),
+            """
+            INSERT OR IGNORE INTO processed_emails
+                (uid, sender, subject, attachment_count,
+                 sender_display, message_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (uid, sender, subject, attachment_count, sender_display, message_id),
         )
         self.db.commit()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Per-attachment outcome tracking (for reply-summary feature)
+    # ──────────────────────────────────────────────────────────────────
+
+    def record_outcome(
+        self,
+        uid: str,
+        original_filename: str,
+        is_video: bool,
+        state: str,
+        reason: "FailureReason | str | None" = None,
+        detail: dict | None = None,
+        output_filename: str | None = None,
+    ) -> None:
+        """UPSERT one row in attachment_outcomes.
+
+        ``state`` is one of 'pending', 'pushed', 'failed'. ``reason`` is
+        a FailureReason enum value or its string form (or None for
+        pending/pushed rows). ``output_filename`` is the processed-stage
+        name (e.g. ``"123_photo.jpg"``) — used by the cross-cycle retry
+        loop to map a file in ``processed/`` back to this row.
+        """
+        reason_str = reason.value if hasattr(reason, "value") else reason
+        detail_json = json.dumps(detail) if detail else None
+        # COALESCE on update so passing output_filename=None doesn't
+        # blank out a value set by an earlier write.
+        self.db.execute(
+            """
+            INSERT INTO attachment_outcomes
+                (uid, original_filename, is_video, state,
+                 reason, detail_json, output_filename, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(uid, original_filename) DO UPDATE SET
+                is_video        = excluded.is_video,
+                state           = excluded.state,
+                reason          = excluded.reason,
+                detail_json     = excluded.detail_json,
+                output_filename = COALESCE(excluded.output_filename,
+                                           attachment_outcomes.output_filename),
+                updated_at      = CURRENT_TIMESTAMP
+            """,
+            (uid, original_filename, int(is_video), state,
+             reason_str, detail_json, output_filename),
+        )
+        self.db.commit()
+
+    def lookup_pending_by_output(
+        self, uid: str, output_filename: str
+    ) -> tuple[str, bool] | None:
+        """Find the (original_filename, is_video) row for a pending leftover.
+
+        Used at retry time when we only have the file in ``processed/``
+        and need to map it back to its DB record so we can mark it pushed.
+        """
+        row = self.db.execute(
+            """
+            SELECT original_filename, is_video
+            FROM attachment_outcomes
+            WHERE uid = ? AND output_filename = ? AND state = 'pending'
+            """,
+            (uid, output_filename),
+        ).fetchone()
+        if not row:
+            return None
+        return row[0], bool(row[1])
+
+    def pending_count(self, uid: str) -> int:
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM attachment_outcomes WHERE uid = ? AND state = 'pending'",
+            (uid,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def pending_resolution_uids(self) -> list[str]:
+        """UIDs that have at least one outcome row but no reply sent yet."""
+        rows = self.db.execute(
+            """
+            SELECT DISTINCT pe.uid
+            FROM processed_emails pe
+            JOIN attachment_outcomes ao ON ao.uid = pe.uid
+            WHERE pe.reply_sent = 0
+            """
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def get_email_outcome(self, uid: str) -> "EmailOutcome | None":
+        """Build an EmailOutcome by joining processed_emails + attachment_outcomes."""
+        from email_replier import (  # local import avoids circular dep
+            AttachmentOutcome, EmailOutcome, FailureReason,
+        )
+        meta = self.db.execute(
+            """
+            SELECT sender, sender_display, subject, message_id
+            FROM processed_emails WHERE uid = ?
+            """,
+            (uid,),
+        ).fetchone()
+        if not meta:
+            return None
+        sender_addr, sender_display, subject, message_id = meta
+
+        rows = self.db.execute(
+            """
+            SELECT original_filename, is_video, state, reason, detail_json
+            FROM attachment_outcomes WHERE uid = ?
+            """,
+            (uid,),
+        ).fetchall()
+        items: list[AttachmentOutcome] = []
+        for fname, is_video, state, reason_str, detail_json in rows:
+            try:
+                reason = FailureReason(reason_str) if reason_str else None
+            except ValueError:
+                reason = FailureReason.UNKNOWN
+            try:
+                detail = json.loads(detail_json) if detail_json else None
+            except (TypeError, ValueError):
+                detail = None
+            items.append(AttachmentOutcome(
+                original_filename=fname,
+                is_video=bool(is_video),
+                state=state,
+                reason=reason,
+                detail=detail,
+            ))
+
+        return EmailOutcome(
+            uid=uid,
+            sender_addr=sender_addr or "",
+            sender_display=sender_display or sender_addr or "",
+            subject=subject or "",
+            message_id=message_id,
+            items=items,
+        )
+
+    def mark_reply_sent(self, uid: str) -> None:
+        self.db.execute(
+            "UPDATE processed_emails SET reply_sent = 1 WHERE uid = ?", (uid,),
+        )
+        self.db.commit()
+
+    def is_reply_sent(self, uid: str) -> bool:
+        row = self.db.execute(
+            "SELECT reply_sent FROM processed_emails WHERE uid = ?", (uid,),
+        ).fetchone()
+        return bool(row and row[0])

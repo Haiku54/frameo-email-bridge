@@ -7,6 +7,17 @@ email:
   subject_filter: ""              # Only emails with this subject are processed. Empty = accept all subjects.
   allowed_senders: []             # Empty = accept from all senders. Example: ["mom@example.com", "dad@example.com"]
 
+  # ── Hebrew reply summary (optional) ─────────────────────────────────
+  # When enabled, after each email is processed the bridge sends a friendly
+  # Hebrew reply back to the sender summarising what reached the frame and
+  # explaining (in family-readable terms) anything that didn't. The reply
+  # threads as a "Re:" so it lands inside the same conversation in Gmail.
+  # Disabled by default — existing installs are not affected.
+  reply_with_summary: false       # Set to true to enable summary replies.
+  smtp_server: smtp.gmail.com     # SMTP host (used only when reply_with_summary is true).
+  smtp_port: 587                  # 587 = STARTTLS (Gmail default). 465 = SMTPS.
+  smtp_from_name: "Frameo"        # Display name shown in the reply's From: header.
+
 frame:
   adb_ip: ""                      # Frame's WiFi IP (set automatically by configure.py)
   adb_port: 5555

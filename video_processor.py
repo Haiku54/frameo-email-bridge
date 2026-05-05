@@ -26,6 +26,21 @@ class FfmpegNotInstalledError(VideoProcessingError):
     pass
 
 
+class VideoTooLongError(VideoProcessingError):
+    """Video duration exceeds the configured max_video_duration_seconds."""
+
+    def __init__(self, duration_seconds: float, limit_seconds: float):
+        super().__init__(
+            f"Video is {duration_seconds:.1f}s, exceeds limit of {limit_seconds:.0f}s"
+        )
+        self.duration_seconds = duration_seconds
+        self.limit_seconds = limit_seconds
+
+
+class VideoTimeoutError(VideoProcessingError):
+    """ffmpeg/ffprobe took longer than the per-call timeout."""
+
+
 def is_video_file(path: Path) -> bool:
     """Check if a file has a video extension."""
     return Path(path).suffix.lower() in VIDEO_EXTENSIONS
@@ -55,12 +70,17 @@ def process_video(input_path: Path, output_path: Path, config: dict) -> Path:
     max_h = int(config.get("resolution_height", 800))
     max_bytes = int(config.get("video_max_file_size_mb", 20) * 1024 * 1024)
 
-    # Fast path: if the file is already an .mp4, already short enough,
-    # already within the size budget, and already within the target
-    # resolution, just copy it rather than re-encoding.
+    # Reject videos longer than the configured limit. Prior versions silently
+    # trimmed; rejecting lets the bridge tell the sender (via reply summary)
+    # that their video didn't make it and why.
+    if duration > max_duration:
+        raise VideoTooLongError(duration, max_duration)
+
+    # Fast path: if the file is already an .mp4, already within the size
+    # budget, and already within the target resolution, just copy it
+    # rather than re-encoding.
     if (
         input_path.suffix.lower() == ".mp4"
-        and duration <= max_duration
         and input_path.stat().st_size <= max_bytes
     ):
         dims = _get_video_dimensions(input_path)
@@ -74,12 +94,7 @@ def process_video(input_path: Path, output_path: Path, config: dict) -> Path:
             )
             return output_path
 
-    trim_seconds = min(duration, max_duration)
-    if duration > max_duration:
-        logger.info(
-            "Video is %.1fs, trimming to %.1fs (max_video_duration_seconds)",
-            duration, max_duration,
-        )
+    trim_seconds = duration
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -183,7 +198,7 @@ def get_video_duration(path: Path) -> float:
     except FileNotFoundError:
         raise FfmpegNotInstalledError(_ffmpeg_install_hint())
     except subprocess.TimeoutExpired:
-        raise VideoProcessingError(f"ffprobe timed out on {path.name}")
+        raise VideoTimeoutError(f"ffprobe timed out on {path.name}")
 
     if result.returncode != 0:
         raise VideoProcessingError(
@@ -233,7 +248,7 @@ def _encode_video(
     except FileNotFoundError:
         raise FfmpegNotInstalledError(_ffmpeg_install_hint())
     except subprocess.TimeoutExpired:
-        raise VideoProcessingError(f"ffmpeg timed out encoding {input_path.name}")
+        raise VideoTimeoutError(f"ffmpeg timed out encoding {input_path.name}")
 
     if result.returncode != 0:
         raise VideoProcessingError(
